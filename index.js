@@ -4,8 +4,19 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
+// Email OTP Auth routes
+const emailAuthRoutes = require('./routes/emailAuth');
+app.use('/email-auth', emailAuthRoutes);
+
+
+
 app.get('/', (req, res) => {
   res.send('Meal Manager Backend is running!');
+});
+
+// Simple ping endpoint for health check
+app.get('/ping', (req, res) => {
+  res.status(200).send('pong');
 });
 
 // Sample route for meals
