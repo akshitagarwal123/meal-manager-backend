@@ -1,12 +1,21 @@
+
 const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
+// User routes
+const userRoutes = require('./routes/user');
+app.use('/users', userRoutes);
 
 app.use(express.json());
 
 // Email OTP Auth routes
 const emailAuthRoutes = require('./routes/emailAuth');
+
 app.use('/email-auth', emailAuthRoutes);
+
+// Admin routes
+const adminRoutes = require('./routes/admin');
+app.use('/admin', adminRoutes);
 
 
 
