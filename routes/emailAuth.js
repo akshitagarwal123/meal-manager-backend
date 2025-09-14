@@ -4,31 +4,67 @@ const pool = require('../config/db');
 const transporter = require('../config/email');
 const router = express.Router();
 
+// Save user details after OTP verification
+router.post('/save-details', async (req, res) => {
+  const { username, email, phone } = req.body;
+  console.log(`[SAVE DETAILS] Request received: username=${username}, email=${email}, phone=${phone}`);
+  if (!username || !email || !phone) {
+    return res.status(400).json({ error: 'All fields required: username, email, phone' });
+  }
+  try {
+    // Check if user with same email exists
+    const existingUserResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (existingUserResult.rows.length > 0) {
+      const response = { error: 'Email already exists' };
+      console.log('[SAVE DETAILS] Response:', response);
+      return res.status(409).json(response);
+    }
+    // Insert new user
+    await pool.query('INSERT INTO users (name, email, phone) VALUES ($1, $2, $3)', [username, email, phone]);
+    console.log(`[SAVE DETAILS] New user created: ${email}`);
+    // Fetch user to get id
+    const newUserResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    let token = null;
+    if (newUserResult.rows.length > 0) {
+      token = jwt.sign({ email: newUserResult.rows[0].email, username: newUserResult.rows[0].name }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    }
+    const response = { success: true, message: 'User details saved', token };
+    console.log('[SAVE DETAILS] Response:', response);
+    return res.json(response);
+  } catch (err) {
+    console.error(`[SAVE DETAILS] Error for ${email}:`, err);
+    res.status(500).json({ error: 'Failed to save user details', details: err.message });
+  }
+});
+
+
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
 // Send OTP to email
 router.post('/send-otp', async (req, res) => {
-  const { email, username } = req.body;
-  console.log(`[SEND OTP] Request received: email=${email}, username=${username}`);
-  if (!email || !username) {
-    console.warn('[SEND OTP] Missing email or username');
-    return res.status(400).json({ error: 'Email and username required' });
+  const { email } = req.body;
+  console.log(`[SEND OTP] Request received: email=${email}`);
+  if (!email) {
+    console.warn('[SEND OTP] Missing email');
+    return res.status(400).json({ error: 'Email required' });
   }
   const otp = generateOTP();
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 min expiry
   try {
-    await pool.query('INSERT INTO email_otps (email, otp, username, expires_at) VALUES ($1, $2, $3, $4)', [email, otp, username, expiresAt]);
+    await pool.query('INSERT INTO email_otps (email, otp, expires_at) VALUES ($1, $2, $3)', [email, otp, expiresAt]);
     console.log(`[SEND OTP] OTP inserted for ${email}, OTP: ${otp}`);
     await transporter.sendMail({
       from: process.env.EMAIL_USER,
       to: email,
       subject: 'Your OTP for Meal Manager',
-      text: `Hello ${username},\nYour OTP is ${otp}. It is valid for 5 minutes.`
+      text: `Your OTP is ${otp}. It is valid for 5 minutes.`
     });
     console.log(`[SEND OTP] Email sent to ${email}`);
-    res.json({ success: true, message: 'OTP sent to email' });
+  const response = { success: true, message: 'OTP sent to email' };
+  console.log('[SEND OTP] Response:', response);
+  res.json(response);
   } catch (err) {
     console.error(`[SEND OTP] Error for ${email}:`, err);
     res.status(500).json({ error: 'Failed to send OTP', details: err.message });
@@ -46,18 +82,19 @@ router.post('/verify-otp', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM email_otps WHERE email = $1 AND otp = $2 AND expires_at > NOW()', [email, otp]);
     if (result.rows.length > 0) {
-      const username = result.rows[0].username || '';
-      console.log(`[VERIFY OTP] OTP valid for ${email}, username=${username}`);
+      console.log(`[VERIFY OTP] OTP valid for ${email}`);
       await pool.query('DELETE FROM email_otps WHERE email = $1', [email]); // Clean up
-      let user = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-      if (user.rows.length === 0) {
-        await pool.query('INSERT INTO users (email, name) VALUES ($1, $2)', [email, username]);
-        user = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        console.log(`[VERIFY OTP] New user created: ${email}`);
+      const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+      let profileStatus = 'NOT_EXISTS';
+      let token = null;
+      if (userResult.rows.length > 0) {
+        profileStatus = 'EXISTS';
+  token = jwt.sign({ email: userResult.rows[0].email, username: userResult.rows[0].name }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        console.log(`[VERIFY OTP] JWT issued for ${email}`);
       }
-      const token = jwt.sign({ email: user.rows[0].email, id: user.rows[0].id }, process.env.JWT_SECRET, { expiresIn: '1h' });
-      console.log(`[VERIFY OTP] JWT issued for ${email}`);
-      res.json({ success: true, message: 'OTP verified, user created if not present', token });
+  const response = { success: true, message: 'OTP verified', token, profileStatus };
+  console.log('[VERIFY OTP] Response:', response);
+  res.json(response);
     } else {
       console.warn(`[VERIFY OTP] Invalid or expired OTP for ${email}`);
       res.status(401).json({ error: 'Invalid or expired OTP' });

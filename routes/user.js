@@ -1,7 +1,22 @@
+
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 const QRCode = require('qrcode');
+const authenticateToken = require('../middleware/authenticateToken');
+
+// Get list of PGs for user selection after login
+router.get('/pgs', authenticateToken, async (req, res) => {
+	try {
+		const result = await pool.query('SELECT id, name, address FROM pgs');
+		const response = { success: true, pgs: result.rows };
+		console.log('[GET PGs] Response:', response);
+		res.json(response);
+	} catch (err) {
+		console.error('[GET PGs] Error:', err);
+		res.status(500).json({ error: 'Failed to fetch PGs', details: err.message });
+	}
+});
 
 // User enrolls or opts out for a meal
 router.post('/meal-response', async (req, res) => {
