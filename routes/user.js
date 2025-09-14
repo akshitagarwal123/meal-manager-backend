@@ -1,3 +1,8 @@
+const express = require('express');
+const router = express.Router();
+const pool = require('../config/db');
+const QRCode = require('qrcode');
+
 // User enrolls or opts out for a meal
 router.post('/meal-response', async (req, res) => {
 	const { email, meal_id, enrolled } = req.body;
@@ -20,10 +25,7 @@ router.post('/meal-response', async (req, res) => {
 	}
 });
 
-const express = require('express');
-const router = express.Router();
-const pool = require('../config/db');
-const QRCode = require('qrcode');
+
 
 // Get user profile
 router.get('/:id', async (req, res) => {

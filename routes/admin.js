@@ -1,3 +1,8 @@
+const express = require('express');
+const router = express.Router();
+const jwt = require('jsonwebtoken');
+const pool = require('../config/db');
+
 // Scan QR and mark attendance
 router.post('/scan', async (req, res) => {
 	const { email } = req.body;
@@ -31,10 +36,7 @@ router.post('/scan', async (req, res) => {
 		res.status(500).json({ error: 'Server error', details: err.message });
 	}
 });
-const express = require('express');
-const router = express.Router();
-const jwt = require('jsonwebtoken');
-const pool = require('../config/db');
+
 
 // Admin login route
 router.post('/login', async (req, res) => {
