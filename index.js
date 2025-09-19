@@ -1,16 +1,15 @@
 
 const express = require('express');
 const app = express();
+app.use(express.json()); // <-- Parse JSON bodies before routes
 const PORT = process.env.PORT || 3000;
+
 // User routes
 const userRoutes = require('./routes/user');
-app.use('/users', userRoutes);
-
-app.use(express.json());
+app.use('/user', userRoutes);
 
 // Email OTP Auth routes
 const emailAuthRoutes = require('./routes/emailAuth');
-
 app.use('/email-auth', emailAuthRoutes);
 
 // Admin routes
