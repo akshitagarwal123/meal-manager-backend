@@ -1,9 +1,83 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
-const QRCode = require('qrcode');
 const authenticateToken = require('../middleware/authenticateToken');
-const crypto = require('crypto');
+
+
+// Update/save device token for the authenticated user
+router.post('/saveDeviceToken', authenticateToken, async (req, res) => {
+    const { deviceToken } = req.body;
+    const user_email = req.user.email;
+    console.log(`[SAVE DEVICE TOKEN] Request received: user_email=${user_email}, deviceToken=${deviceToken}`);
+    if (!deviceToken) {
+        console.warn('[SAVE DEVICE TOKEN] deviceToken missing in request body');
+        return res.status(400).json({ error: 'deviceToken is required' });
+    }
+    try {
+        // Update device_token for the user identified by email
+        const result = await pool.query(
+            'UPDATE users SET device_token = $1 WHERE email = $2 RETURNING *',
+            [deviceToken, user_email]
+        );
+        if (result.rowCount === 0) {
+            console.warn('[SAVE DEVICE TOKEN] User not found for email:', user_email);
+            return res.status(404).json({ error: 'User not found' });
+        }
+        console.log('[SAVE DEVICE TOKEN] Device token updated for user_email=%s', user_email);
+        res.json({ success: true, message: 'Device token updated', user: result.rows[0] });
+    } catch (err) {
+        console.error('[SAVE DEVICE TOKEN] Error:', err.message);
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
+});
+
+// User withdraws their pending enrollment request
+router.post('/withdraw-enrollment', authenticateToken, async (req, res) => {
+    const { pg_id } = req.body;
+    let user_id = req.user.id || req.user.user_id;
+    const user_email = req.user.email;
+    console.log(`[WITHDRAW ENROLLMENT] Request received: user_id=${user_id}, user_email=${user_email}, pg_id=${pg_id}`);
+    if ((!user_id && !user_email) || !pg_id) {
+        console.warn('[WITHDRAW ENROLLMENT] Missing user_id/user_email or pg_id');
+        return res.status(400).json({ error: 'pg_id is required in body and user must be authenticated' });
+    }
+    try {
+        // If user_id is not present, fetch it using email
+        if (!user_id && user_email) {
+            console.log('[WITHDRAW ENROLLMENT] Fetching user_id from DB using email:', user_email);
+            const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [user_email]);
+            if (userResult.rows.length === 0) {
+                console.warn('[WITHDRAW ENROLLMENT] No user found for email:', user_email);
+                return res.status(404).json({ error: 'User not found' });
+            }
+            user_id = userResult.rows[0].id;
+            console.log('[WITHDRAW ENROLLMENT] Found user_id:', user_id);
+        }
+        // Check if a pending enrollment exists
+        console.log('[WITHDRAW ENROLLMENT] Checking for pending enrollment...');
+        const checkResult = await pool.query(
+            `SELECT * FROM enrollments WHERE user_id = $1 AND pg_id = $2 AND status = 1`,
+            [user_id, pg_id]
+        );
+        if (checkResult.rowCount === 0) {
+            console.warn('[WITHDRAW ENROLLMENT] No pending enrollment found for user_id=%s, pg_id=%s', user_id, pg_id);
+            return res.status(404).json({ error: 'No pending enrollment found for this user and PG' });
+        }
+        // Delete the pending enrollment
+        console.log('[WITHDRAW ENROLLMENT] Deleting pending enrollment for user_id=%s, pg_id=%s', user_id, pg_id);
+        await pool.query(
+            `DELETE FROM enrollments WHERE user_id = $1 AND pg_id = $2 AND status = 1`,
+            [user_id, pg_id]
+        );
+        console.log('[WITHDRAW ENROLLMENT] Enrollment request withdrawn for user_id=%s, pg_id=%s', user_id, pg_id);
+        res.json({ success: true, message: 'Enrollment request withdrawn' });
+    } catch (err) {
+        console.error('[WITHDRAW ENROLLMENT] Error:', err.message);
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
+});
+
+
 
 
 // Check user enrollment status
@@ -107,15 +181,20 @@ router.get('/:id', async (req, res) => {
 });
 
 // Create user
-router.post('/', async (req, res) => {
-    const { username, email, phone, pg_id } = req.body;
+router.post('/create-user', async (req, res) => {
+    const { username, email, phone, pg_id, deviceToken } = req.body;
     // Generate a 6-digit UUID (numeric string)
     const id = Math.floor(100000 + Math.random() * 900000).toString();
     try {
-        const result = await pool.query(
-            'INSERT INTO users (id, username, email, phone, pg_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-            [id, username, email, phone, pg_id]
-        );
+        let query, params;
+        if (pg_id) {
+            query = 'INSERT INTO users (id, username, email, phone, pg_id, device_token) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *';
+            params = [id, username, email, phone, pg_id, deviceToken];
+        } else {
+            query = 'INSERT INTO users (id, username, email, phone, device_token) VALUES ($1, $2, $3, $4, $5) RETURNING *';
+            params = [id, username, email, phone, deviceToken];
+        }
+        const result = await pool.query(query, params);
         res.status(201).json(result.rows[0]);
     } catch (err) {
         res.status(500).json({ error: 'Server error', details: err.message });

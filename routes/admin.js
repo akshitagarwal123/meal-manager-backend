@@ -1,9 +1,65 @@
-
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
+const { sendPushNotification } = require('../utils/notifications');
 const authenticateToken = require('../middleware/authenticateToken');
+
+// Admin triggers push notifications to all users enrolled in a PG
+router.post('/sendNotifications', authenticateToken, async (req, res) => {
+    // Extract notification details and PG ID from request body
+    const { title, body, pg_id } = req.body;
+    // Log the incoming request
+    console.log(`[SEND NOTIFICATIONS] Request received: title="${title}", body="${body}", pg_id=${pg_id}`);
+
+    // Validate required fields
+    if (!title || !body || !pg_id) {
+        console.warn('[SEND NOTIFICATIONS] Missing required fields in request body');
+        return res.status(400).json({ error: 'title, body, and pg_id are required' });
+    }
+    try {
+        // Query device tokens for all users enrolled in the specified PG (status=2 means approved/enrolled)
+        console.log('[SEND NOTIFICATIONS] Fetching device tokens for enrolled users in PG:', pg_id);
+        const result = await pool.query(
+            `SELECT u.device_token FROM users u
+             JOIN enrollments e ON u.id = e.user_id
+             WHERE e.pg_id = $1 AND e.status = 2 AND u.device_token IS NOT NULL`,
+            [pg_id]
+        );
+        // Extract and filter device tokens
+        const deviceTokens = result.rows.map(row => row.device_token).filter(Boolean);
+        console.log(`[SEND NOTIFICATIONS] Found ${deviceTokens.length} device tokens.`);
+        if (deviceTokens.length === 0) {
+            // No device tokens found for enrolled users
+            console.warn('[SEND NOTIFICATIONS] No device tokens found for enrolled users in PG:', pg_id);
+            return res.status(404).json({ error: 'No device tokens found for enrolled users in this PG' });
+        }
+        let results = [];
+        // Send notification to each device token
+        for (const token of deviceTokens) {
+            try {
+                await sendPushNotification(token, title, body);
+                results.push({ token, status: 'sent' });
+            } catch (err) {
+                // Log and record any errors for individual tokens
+                console.error(`[SEND NOTIFICATIONS] Error sending to token ${token}:`, err.message);
+                results.push({ token, status: 'error', error: err.message });
+            }
+        }
+        // Log and return the results
+        console.log('[SEND NOTIFICATIONS] Notification results:', results);
+        res.json({ success: true, results });
+    } catch (err) {
+        // Log and return any server errors
+        console.error('[SEND NOTIFICATIONS] Error sending push notifications:', err.message);
+        res.status(500).json({ error: 'Failed to send notifications', details: err.message });
+    }
+});
+
+// Admin triggers a push notification (placeholder, not implemented)
+router.post('/notifications', authenticateToken, async (req, res) => {
+    res.status(200).json({ message: 'This endpoint is not implemented yet.' });
+});
 
 // Approve a user's enrollment to a PG
 router.post('/approve-enrollment', authenticateToken, async (req, res) => {

@@ -48,4 +48,25 @@ async function triggerMealNotification(mealType) {
   }
 }
 
+// --- MOCK PUSH NOTIFICATION TEST ---
+const { sendPushNotification } = require('../utils/notifications');
+
+async function testPushNotification() {
+  // Replace with a real device token for actual test
+  const mockDeviceToken = 'YOUR_TEST_DEVICE_TOKEN';
+  try {
+    const result = await sendPushNotification(
+      mockDeviceToken,
+      'Test Notification',
+      'This is a mock push notification from backend.'
+    );
+    console.log('Notification sent:', result);
+  } catch (err) {
+    console.error('Error sending notification:', err.message);
+  }
+}
+
+// Uncomment to test
+// testPushNotification();
+
 module.exports = {};
