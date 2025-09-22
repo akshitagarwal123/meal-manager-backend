@@ -5,6 +5,146 @@ const pool = require('../config/db');
 const { sendPushNotification } = require('../utils/notifications');
 const authenticateToken = require('../middleware/authenticateToken');
 
+
+// Save or update device token for the authenticated admin
+router.post('/saveDeviceToken', authenticateToken, async (req, res) => {
+    const { deviceToken } = req.body;
+    // Admin ID is available in JWT as adminId
+    const adminId = req.user && (req.user.adminId || req.user.id);
+    if (!deviceToken) {
+        console.warn('[ADMIN SAVE DEVICE TOKEN] deviceToken missing in request body');
+        return res.status(400).json({ error: 'deviceToken is required' });
+    }
+    if (!adminId) {
+        console.warn('[ADMIN SAVE DEVICE TOKEN] adminId missing in JWT');
+        return res.status(401).json({ error: 'Unauthorized: adminId missing' });
+    }
+    try {
+        const result = await pool.query(
+            'UPDATE admins SET device_token = $1 WHERE id = $2 RETURNING *',
+            [deviceToken, adminId]
+        );
+        if (result.rowCount === 0) {
+            console.warn('[ADMIN SAVE DEVICE TOKEN] Admin not found for id:', adminId);
+            return res.status(404).json({ error: 'Admin not found' });
+        }
+        console.log('[ADMIN SAVE DEVICE TOKEN] Device token updated for adminId=%s', adminId);
+        res.json({ success: true, message: 'Device token updated', admin: result.rows[0] });
+    } catch (err) {
+        console.error('[ADMIN SAVE DEVICE TOKEN] Error:', err.message);
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
+});
+
+// Admin endpoint to decline a user's enrollment to a PG
+router.post('/decline-enrollment', authenticateToken, async (req, res) => {
+    const { user_id, pg_id } = req.body;
+    console.log(`[DECLINE ENROLLMENT] Request received: user_id=${user_id}, pg_id=${pg_id}`);
+    if (!user_id || !pg_id) {
+        console.warn('[DECLINE ENROLLMENT] Missing user_id or pg_id in request body');
+        return res.status(400).json({ error: 'user_id and pg_id are required in body' });
+    }
+    try {
+        // Delete the pending enrollment entry
+        console.log('[DECLINE ENROLLMENT] Deleting pending enrollment entry');
+        const result = await pool.query(
+            `DELETE FROM enrollments WHERE user_id = $1 AND pg_id = $2 AND status = 1 RETURNING *`,
+            [user_id, pg_id]
+        );
+        if (result.rowCount === 0) {
+            console.warn('[DECLINE ENROLLMENT] Pending enrollment not found for user_id:', user_id, 'pg_id:', pg_id);
+            return res.status(404).json({ error: 'Pending enrollment not found for this user and PG' });
+        }
+        console.log('[DECLINE ENROLLMENT] Enrollment entry deleted:', result.rows[0]);
+        res.json({ success: true, message: 'Enrollment declined and entry deleted', enrollment: result.rows[0] });
+    } catch (err) {
+        console.error('[DECLINE ENROLLMENT] Error:', err.message);
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
+});
+
+// Admin endpoint to add a new user and enroll them in a PG
+router.post('/add-user', authenticateToken, async (req, res) => {
+    const { name, email, phone, pg_id } = req.body;
+    if (!name || !email || !phone || !pg_id) {
+        return res.status(400).json({ error: 'Name, email, phone, and pg_id are required' });
+    }
+    try {
+        // Insert new user into users table
+        const userResult = await pool.query(
+            'INSERT INTO users (name, email, phone) VALUES ($1, $2, $3) RETURNING *',
+            [name, email, phone]
+        );
+        const user = userResult.rows[0];
+        // Enroll the user in the specified PG with status=2 (approved)
+        await pool.query(
+            'INSERT INTO enrollments (user_id, user_email, pg_id, status) VALUES ($1, $2, $3, 2)',
+            [user.id, user.email, pg_id]
+        );
+        res.json({ success: true, message: 'User added and enrolled successfully', user });
+    } catch (err) {
+        // Handle duplicate email/phone errors
+        if (err.code === '23505') {
+            return res.status(409).json({ error: 'User with this email or phone already exists' });
+        }
+        console.error('[ADD USER] Error:', err.message);
+        res.status(500).json({ error: 'Failed to add and enroll user', details: err.message });
+    }
+});
+
+// Admin endpoint to update user details by user ID
+router.put('/update-user/:userId', authenticateToken, async (req, res) => {
+    const { userId } = req.params;
+    const { name, email, phone } = req.body;
+    if (!userId) {
+        return res.status(400).json({ error: 'User ID is required' });
+    }
+    if (!name && !email && !phone) {
+        return res.status(400).json({ error: 'At least one field (name, email, phone) is required to update' });
+    }
+    try {
+        // Build dynamic update query
+        const fields = [];
+        const values = [];
+        let idx = 1;
+        if (name) { fields.push(`name = $${idx++}`); values.push(name); }
+        if (email) { fields.push(`email = $${idx++}`); values.push(email); }
+        if (phone) { fields.push(`phone = $${idx++}`); values.push(phone); }
+        values.push(userId);
+        const query = `UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`;
+        const result = await pool.query(query, values);
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        res.json({ success: true, message: 'User updated successfully', user: result.rows[0] });
+    } catch (err) {
+        console.error('[UPDATE USER] Error:', err.message);
+        res.status(500).json({ error: 'Failed to update user', details: err.message });
+    }
+});
+
+
+// Admin endpoint to delete a user by user ID
+router.delete('/delete-user/:userId', authenticateToken, async (req, res) => {
+    const { userId } = req.params;
+    if (!userId) {
+        return res.status(400).json({ error: 'User ID is required' });
+    }
+    try {
+        // First, delete user's enrollments
+        await pool.query('DELETE FROM enrollments WHERE user_id = $1', [userId]);
+        // Then, delete user from users table
+        const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING *', [userId]);
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        res.json({ success: true, message: 'User and enrollments deleted successfully', user: result.rows[0] });
+    } catch (err) {
+        console.error('[DELETE USER] Error:', err.message);
+        res.status(500).json({ error: 'Failed to delete user', details: err.message });
+    }
+});
+
 // Admin triggers push notifications to all users enrolled in a PG
 router.post('/sendNotifications', authenticateToken, async (req, res) => {
     // Extract notification details and PG ID from request body
@@ -83,39 +223,6 @@ router.post('/approve-enrollment', authenticateToken, async (req, res) => {
     }
 });
 
-// Scan QR and mark attendance
-router.post('/scan', async (req, res) => {
-	const { email } = req.body;
-	const meal_date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-	console.log(`[SCAN] Request: email=${email}, date=${meal_date}`);
-	try {
-		const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-		if (userResult.rows.length === 0) {
-			console.log('[SCAN] User not found');
-			return res.status(404).json({ error: 'User not found', flag: true });
-		}
-		const userId = userResult.rows[0].id;
-
-		const mealResult = await pool.query(
-			'SELECT * FROM meal_responses WHERE user_id = $1 AND date = $2 AND enrolled = true',
-			[userId, meal_date]
-		);
-		if (mealResult.rows.length === 0) {
-			console.log('[SCAN] User not enrolled for meal');
-			return res.status(403).json({ error: 'User not enrolled for meal', flag: true });
-		}
-
-		await pool.query(
-			'INSERT INTO attendance (user_id, date, attended) VALUES ($1, $2, true) ON CONFLICT (user_id, date) DO UPDATE SET attended = true',
-			[userId, meal_date]
-		);
-		console.log(`[SCAN] Attendance marked for userId=${userId}, date=${meal_date}`);
-		res.json({ message: 'Attendance marked', attended: true });
-	} catch (err) {
-		console.error('[SCAN] Error:', err);
-		res.status(500).json({ error: 'Server error', details: err.message });
-	}
-});
 
 // Mark attendance for user from QR code data (admin only)
 router.post('/mark-attendance', authenticateToken, async (req, res) => {
@@ -151,37 +258,63 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
                 return res.status(400).json({ error: 'Invalid nested email format' });
             }
         }
-        if (email.startsWith('mailto:')) {
-            email = email.replace('mailto:', '');
-        }
         console.log('[MARK ATTENDANCE] Extracted email:', email);
 
         // Get user
-        const userResult = await pool.query('SELECT email FROM users WHERE email = $1', [email]);
+        const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
         if (userResult.rows.length === 0) {
             console.warn('[MARK ATTENDANCE] User not found');
             return res.status(404).json({ error: 'User not found' });
         }
-        console.log('[MARK ATTENDANCE] User found');
+        const userId = userResult.rows[0].id;
+        console.log('[MARK ATTENDANCE] User found, id:', userId);
+
+        // Get admin's PG ID from JWT or DB
+        const adminId = req.user && (req.user.adminId || req.user.id);
+        let adminPgId = req.user && req.user.pg_id;
+        if (!adminPgId && adminId) {
+            const adminResult = await pool.query('SELECT pg_id FROM admins WHERE id = $1', [adminId]);
+            if (adminResult.rows.length > 0) {
+                adminPgId = adminResult.rows[0].pg_id;
+            }
+        }
+        if (!adminPgId) {
+            console.warn('[MARK ATTENDANCE] Admin PG ID not found');
+            return res.status(400).json({ error: 'Admin PG ID not found' });
+        }
+        console.log('[MARK ATTENDANCE] Admin PG ID:', adminPgId);
+
+        // Check if user is enrolled in this PG (status=2 means approved)
+        const enrollmentResult = await pool.query(
+            'SELECT * FROM enrollments WHERE user_id = $1 AND pg_id = $2 AND status = 2',
+            [userId, adminPgId]
+        );
+        if (enrollmentResult.rows.length === 0) {
+            console.warn('[MARK ATTENDANCE] User not enrolled in this PG');
+            return res.status(403).json({ error: 'User not enrolled in this PG' });
+        }
 
         // Get today's date
         const meal_date = new Date().toISOString().slice(0, 10);
         console.log(`[MARK ATTENDANCE] Meal date: ${meal_date}`);
 
-        // Check if user is enrolled for today's meal (logic removed temporarily)
+        // Check if user is enrolled for today's meal
         // const mealResult = await pool.query(
-        //     'SELECT * FROM meal_responses WHERE email = $1 AND meal_id IN (SELECT id FROM meals WHERE date = $2)',
-        //     [email, meal_date]
+        //     'SELECT * FROM meal_responses WHERE user_id = $1 AND date = $2 AND enrolled = true',
+        //     [userId, meal_date]
         // );
         // if (mealResult.rows.length === 0) {
         //     console.warn('[MARK ATTENDANCE] User not enrolled for today\'s meal');
-        //     return res.status(400).json({ error: 'User not enrolled for today\'s meal' });
+        //     return res.status(403).json({ error: 'User not enrolled for today\'s meal' });
         // }
-        console.log('[MARK ATTENDANCE] User enrolled for today\'s meal');
 
-        // Skip saving attendance and return success message
-        console.log('[MARK ATTENDANCE] Attendance verified successfully');
-        res.json({ message: 'Attendance verified successfully', attended: true });
+        // // Mark attendance
+        // await pool.query(
+        //     'INSERT INTO attendance (user_id, date, attended) VALUES ($1, $2, true) ON CONFLICT (user_id, date) DO UPDATE SET attended = true',
+        //     [userId, meal_date]
+        // );
+        console.log('[MARK ATTENDANCE] Attendance marked for userId=%s, date=%s', userId, meal_date);
+        res.json({ message: 'Attendance marked', attended: true });
     } catch (error) {
         console.error('[MARK ATTENDANCE] Internal server error:', error.message);
         res.status(500).json({ error: 'Internal server error' });
@@ -192,20 +325,21 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
 router.post('/login', async (req, res) => {
 	const { username, password } = req.body;
 	console.log(`[ADMIN LOGIN] Attempt: username=${username}`);
-	try {
-		const result = await pool.query('SELECT * FROM admins WHERE username = $1', [username]);
-		const admin = result.rows[0];
-		if (!admin || admin.password !== password) {
-			console.log('[ADMIN LOGIN] Invalid credentials');
-			return res.status(401).json({ error: 'Invalid credentials' });
-		}
-		const token = jwt.sign({ adminId: admin.id, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '1d' });
-		console.log(`[ADMIN LOGIN] Success: adminId=${admin.id}, token=${token}`);
-		res.json({ token });
-	} catch (err) {
-		console.error('[ADMIN LOGIN] Error:', err);
-		res.status(500).json({ error: 'Server error', details: err.message });
-	}
+    try {
+        const result = await pool.query('SELECT * FROM admins WHERE username = $1', [username]);
+        const admin = result.rows[0];
+        if (!admin || admin.password !== password) {
+            console.log('[ADMIN LOGIN] Invalid credentials');
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        const token = jwt.sign({ adminId: admin.id, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '1d' });
+        // Return pg_id along with token
+        console.log(`[ADMIN LOGIN] Success: adminId=${admin.id}, token=${token}, pg_id=${admin.pg_id}`);
+        res.json({ token, pg_id: admin.pg_id });
+    } catch (err) {
+        console.error('[ADMIN LOGIN] Error:', err);
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
 });
 
 // Example protected admin route

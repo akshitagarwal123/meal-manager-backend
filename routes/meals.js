@@ -1,0 +1,89 @@
+const express = require('express');
+const router = express.Router();
+const pool = require('../config/db');
+const authenticateToken = require('../middleware/authenticateToken');
+
+// Get meal menu for a PG and date
+router.get('/menu', authenticateToken, async (req, res) => {
+    const { pg_id, date } = req.query;
+    console.log(`[GET MEAL MENU] Request received: pg_id=${pg_id}, date=${date}`);
+    if (!pg_id || !date) {
+        console.warn('[GET MEAL MENU] Missing pg_id or date in query params');
+        return res.status(400).json({ error: 'pg_id and date are required as query params' });
+    }
+    try {
+        console.log('[GET MEAL MENU] Querying meal_menus table');
+        const result = await pool.query(
+            'SELECT meal_type, items FROM meal_menus WHERE pg_id = $1 AND date = $2',
+            [pg_id, date]
+        );
+        console.log('[GET MEAL MENU] Meals found:', result.rows.length);
+        res.json({ meals: result.rows });
+    } catch (err) {
+        console.error('[GET MEAL MENU] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch meal menu', details: err.message });
+    }
+});
+
+// Save or update meal menu for a PG, date, and meal_type
+router.post('/menu', authenticateToken, async (req, res) => {
+    const { pg_id, date, meal_type, items } = req.body;
+    console.log(`[SAVE MEAL MENU] Request received: pg_id=${pg_id}, date=${date}, meal_type=${meal_type}, items=${JSON.stringify(items)}`);
+    if (!pg_id || !date || !meal_type || !Array.isArray(items)) {
+        console.warn('[SAVE MEAL MENU] Missing required fields in request body');
+        return res.status(400).json({ error: 'pg_id, date, meal_type, and items[] are required' });
+    }
+    try {
+        console.log('[SAVE MEAL MENU] Upserting meal menu');
+        const upsert = await pool.query(
+            `INSERT INTO meal_menus (pg_id, date, meal_type, items) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (pg_id, date, meal_type)
+             DO UPDATE SET items = $4, updated_at = NOW()
+             RETURNING *`,
+            [pg_id, date, meal_type, JSON.stringify(items)]
+        );
+        console.log('[SAVE MEAL MENU] Upserted meal:', upsert.rows[0]);
+        res.json({ success: true, meal: upsert.rows[0] });
+    } catch (err) {
+        console.error('[SAVE MEAL MENU] Error:', err.message);
+        res.status(500).json({ error: 'Failed to save meal menu', details: err.message });
+    }
+});
+
+// Remove an item from a meal menu
+router.delete('/menu/item', authenticateToken, async (req, res) => {
+    const { pg_id, date, meal_type, item } = req.body;
+    console.log(`[DELETE MEAL ITEM] Request received: pg_id=${pg_id}, date=${date}, meal_type=${meal_type}, item=${item}`);
+    if (!pg_id || !date || !meal_type || !item) {
+        console.warn('[DELETE MEAL ITEM] Missing required fields in request body');
+        return res.status(400).json({ error: 'pg_id, date, meal_type, and item are required' });
+    }
+    try {
+        // Fetch current items
+        console.log('[DELETE MEAL ITEM] Fetching current items');
+        const result = await pool.query(
+            'SELECT items FROM meal_menus WHERE pg_id = $1 AND date = $2 AND meal_type = $3',
+            [pg_id, date, meal_type]
+        );
+        if (result.rows.length === 0) {
+            console.warn('[DELETE MEAL ITEM] Meal menu not found for pg_id:', pg_id, 'date:', date, 'meal_type:', meal_type);
+            return res.status(404).json({ error: 'Meal menu not found' });
+        }
+        let items = result.rows[0].items;
+        if (!Array.isArray(items)) items = [];
+        const newItems = items.filter(i => i !== item);
+        // Update items
+        console.log('[DELETE MEAL ITEM] Updating items after removal');
+        await pool.query(
+            'UPDATE meal_menus SET items = $1, updated_at = NOW() WHERE pg_id = $2 AND date = $3 AND meal_type = $4',
+            [JSON.stringify(newItems), pg_id, date, meal_type]
+        );
+        console.log('[DELETE MEAL ITEM] Updated items:', newItems);
+        res.json({ success: true, items: newItems });
+    } catch (err) {
+        console.error('[DELETE MEAL ITEM] Error:', err.message);
+        res.status(500).json({ error: 'Failed to delete meal item', details: err.message });
+    }
+});
+
+module.exports = router;

@@ -203,14 +203,18 @@ router.post('/create-user', async (req, res) => {
 
 // Generate QR code for a user using email as unique identifier
 router.get('/:email/qrcode', async (req, res) => {
-	const { email } = req.params;
-	try {
-		const qrData = JSON.stringify({ email });
-		const qrImage = await QRCode.toDataURL(qrData);
-		res.json({ qr: qrImage });
-	} catch (err) {
-		res.status(500).json({ error: 'Failed to generate QR', details: err.message });
-	}
+    const { email } = req.params;
+    console.log(`[QR CODE] Request received for email: ${email}`);
+    try {
+        const QRCode = require("qrcode");
+        const qrData = JSON.stringify({ email });
+        const qrImage = await QRCode.toDataURL(qrData);
+        console.log(`[QR CODE] Successfully generated QR for email: ${email}`);
+        res.json({ qr: qrImage });
+    } catch (err) {
+        console.error(`[QR CODE] Failed to generate QR for email: ${email}. Error: ${err.message}`);
+        res.status(500).json({ error: 'Failed to generate QR', details: err.message });
+    }
 });
 
 // Delete user (admin only)
@@ -225,12 +229,10 @@ router.delete('/:id', async (req, res) => {
 });
 
 // User requests to enroll in a PG
+const { sendPushNotification } = require('../utils/notifications');
 router.post('/enroll', authenticateToken, async (req, res) => {
-    console.log(req.body)
-    console.log('Enroll request received:', {
-        user: req.user,
-        body: req.body
-    });
+    console.log('[ENROLL] Request body:', req.body);
+    console.log('[ENROLL] User:', req.user);
     const { email } = req.user; // Using email as userId
     const { pg_id } = req.body;
     if (!pg_id) {
@@ -249,6 +251,41 @@ router.post('/enroll', authenticateToken, async (req, res) => {
             'INSERT INTO enrollments (user_id, user_email, pg_id, status) VALUES ($1, $2, $3, 1) ON CONFLICT (user_email, pg_id) DO UPDATE SET status = 1',
             [userId, email, pg_id]
         );
+
+        // Notify the admin of this PG
+        try {
+            // Find admin for this PG
+            const adminResult = await pool.query('SELECT * FROM admins WHERE pg_id = $1 LIMIT 1', [pg_id]);
+            if (adminResult.rows.length > 0) {
+                const admin = adminResult.rows[0];
+                // Get admin device token (if stored in admins table)
+                let adminDeviceToken = admin.device_token;
+                if (!adminDeviceToken) {
+                    // Try to get from users table if admin uses same email
+                    const adminUserResult = await pool.query('SELECT device_token FROM users WHERE email = $1', [admin.email]);
+                    if (adminUserResult.rows.length > 0) {
+                        adminDeviceToken = adminUserResult.rows[0].device_token;
+                    }
+                }
+                if (adminDeviceToken) {
+                    const title = 'New Enrollment Request';
+                    const body = `${userResult.rows[0].username || userResult.rows[0].name || email} requested to join your PG.`;
+                    try {
+                        await sendPushNotification(adminDeviceToken, title, body);
+                        console.log(`[ENROLL] Notification sent to admin (${admin.email}) for PG ${pg_id}`);
+                    } catch (pushErr) {
+                        console.error(`[ENROLL] Failed to send notification to admin (${admin.email}):`, pushErr.message);
+                    }
+                } else {
+                    console.warn(`[ENROLL] Admin for PG ${pg_id} has no device token, notification not sent.`);
+                }
+            } else {
+                console.warn(`[ENROLL] No admin found for PG ${pg_id}, notification not sent.`);
+            }
+        } catch (notifyErr) {
+            console.error(`[ENROLL] Error notifying admin for PG ${pg_id}:`, notifyErr.message);
+        }
+
         res.json({ message: 'Enrollment request submitted. Pending approval.' });
     } catch (err) {
         console.error('[ENROLL] Error:', err.message);

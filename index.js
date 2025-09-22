@@ -12,9 +12,14 @@ app.use('/user', userRoutes);
 const emailAuthRoutes = require('./routes/emailAuth');
 app.use('/email-auth', emailAuthRoutes);
 
+
 // Admin routes
 const adminRoutes = require('./routes/admin');
 app.use('/admin', adminRoutes);
+
+// Meals routes
+const mealsRoutes = require('./routes/meals');
+app.use('/meals', mealsRoutes);
 
 
 
