@@ -1,3 +1,21 @@
+// Get meals assigned by the admin of the user's PG
+router.get('/assigned-meals', authenticateToken, async (req, res) => {
+    const { email } = req.user;
+    try {
+        // Get user's enrollment and PG
+        const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [email]);
+        if (enrollmentResult.rows.length === 0) {
+            return res.status(403).json({ error: 'User not enrolled in any PG' });
+        }
+        const pg_id = enrollmentResult.rows[0].pg_id;
+        // Fetch meals assigned to this PG
+        const mealsResult = await pool.query('SELECT * FROM meals WHERE pg_id = $1', [pg_id]);
+        res.json({ meals: mealsResult.rows });
+    } catch (err) {
+        console.error('[ASSIGNED MEALS] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch assigned meals', details: err.message });
+    }
+});
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
@@ -143,25 +161,30 @@ router.get('/pgs', authenticateToken, async (req, res) => {
 });
 
 // User enrolls or opts out for a meal
-router.post('/meal-response', async (req, res) => {
-	const { email, meal_id, enrolled } = req.body;
-	try {
-		// Find user by email
-		const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-		if (userResult.rows.length === 0) {
-			return res.status(404).json({ error: 'User not found' });
-		}
-		const userId = userResult.rows[0].id;
+// User enrolls or opts out for a complete meal (e.g., breakfast, lunch, dinner) for a specific date
+router.post('/meal-response', authenticateToken, async (req, res) => {
+    const { meal_type, date, enrolled } = req.body;
+    const email = req.user.email;
+    if (!meal_type || !date || typeof enrolled !== 'boolean') {
+        return res.status(400).json({ error: 'meal_type, date, and enrolled (boolean) are required' });
+    }
+    try {
+        // Find user by email
+        const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        const userId = userResult.rows[0].id;
 
-		// Insert or update meal response
-		await pool.query(
-			'INSERT INTO meal_responses (user_id, meal_id, enrolled) VALUES ($1, $2, $3) ON CONFLICT (user_id, meal_id) DO UPDATE SET enrolled = $3',
-			[userId, meal_id, enrolled]
-		);
-		res.json({ message: 'Meal response recorded', enrolled });
-	} catch (err) {
-		res.status(500).json({ error: 'Server error', details: err.message });
-	}
+        // Insert or update meal response for the whole meal type and date
+        await pool.query(
+            'INSERT INTO meal_responses (user_id, meal_type, date, enrolled) VALUES ($1, $2, $3, $4) ON CONFLICT (user_id, meal_type, date) DO UPDATE SET enrolled = $4',
+            [userId, meal_type, date, enrolled]
+        );
+        res.json({ message: 'Meal response recorded', meal_type, date, enrolled });
+    } catch (err) {
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
 });
 
 
