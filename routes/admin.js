@@ -228,37 +228,28 @@ router.post('/approve-enrollment', authenticateToken, async (req, res) => {
 router.post('/mark-attendance', authenticateToken, async (req, res) => {
     console.log('[MARK ATTENDANCE] Request received');
     try {
-        const { qrData } = req.body;
-        if (!qrData) {
-            console.warn('[MARK ATTENDANCE] QR data missing in request');
-            return res.status(400).json({ error: 'QR data required' });
-        }
-        console.log('[MARK ATTENDANCE] QR data received');
-
-        // Parse QR data (assume it contains email)
-        let parsed;
+    console.log('[MARK ATTENDANCE] Full request body:', req.body);
+    let { email, meal_type } = req.body;
+    // Support email as stringified object, object, or string
+    if (typeof email === 'string' && email.startsWith('{')) {
         try {
-            parsed = JSON.parse(qrData);
-            console.log('[MARK ATTENDANCE] QR data parsed successfully');
-        } catch (err) {
-            console.error('[MARK ATTENDANCE] Invalid QR data format:', err.message);
-            return res.status(400).json({ error: 'Invalid QR data format' });
+            email = JSON.parse(email).email;
+        } catch (e) {
+            console.warn('[MARK ATTENDANCE] Could not parse stringified email object:', email);
+            return res.status(400).json({ error: 'Invalid email format' });
         }
-        console.log('[MARK ATTENDANCE] Parsed data:', parsed);
-        let { email } = parsed;
-        if (!email) {
-            console.warn('[MARK ATTENDANCE] Email missing in QR data');
-            return res.status(400).json({ error: 'Email missing in QR data' });
-        }
-        // Handle double-encoded email JSON string
-        if (typeof email === 'string' && email.startsWith('{')) {
-            try {
-                email = JSON.parse(email).email;
-            } catch (e) {
-                return res.status(400).json({ error: 'Invalid nested email format' });
-            }
-        }
-        console.log('[MARK ATTENDANCE] Extracted email:', email);
+    } else if (typeof email === 'object' && email.email) {
+        email = email.email;
+    }
+    if (!email || typeof email !== 'string') {
+        console.warn('[MARK ATTENDANCE] Email missing or invalid in request body');
+        return res.status(400).json({ error: 'Email is required as a string' });
+    }
+    if (!meal_type) {
+        console.warn('[MARK ATTENDANCE] Meal type missing in request body');
+        return res.status(400).json({ error: 'Meal type is required' });
+    }
+    console.log('[MARK ATTENDANCE] Request received for email:', email, 'meal_type:', meal_type);
 
         // Get user
         const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
@@ -294,27 +285,36 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
             return res.status(403).json({ error: 'User not enrolled in this PG' });
         }
 
+
         // Get today's date
         const meal_date = new Date().toISOString().slice(0, 10);
         console.log(`[MARK ATTENDANCE] Meal date: ${meal_date}`);
 
-        // Check if user is enrolled for today's meal
-        // const mealResult = await pool.query(
-        //     'SELECT * FROM meal_responses WHERE user_id = $1 AND date = $2 AND enrolled = true',
-        //     [userId, meal_date]
-        // );
-        // if (mealResult.rows.length === 0) {
-        //     console.warn('[MARK ATTENDANCE] User not enrolled for today\'s meal');
-        //     return res.status(403).json({ error: 'User not enrolled for today\'s meal' });
-        // }
+        // Check if user is enrolled for this meal type and date
+        const mealEnrollResult = await pool.query(
+            'SELECT * FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
+            [email, adminPgId, meal_type, meal_date]
+        );
+        if (mealEnrollResult.rows.length === 0) {
+            console.warn('[MARK ATTENDANCE] User not enrolled for this meal');
+            return res.status(403).json({ error: 'User not enrolled for this meal' });
+        }
 
-        // // Mark attendance
-        // await pool.query(
-        //     'INSERT INTO attendance (user_id, date, attended) VALUES ($1, $2, true) ON CONFLICT (user_id, date) DO UPDATE SET attended = true',
-        //     [userId, meal_date]
-        // );
-        console.log('[MARK ATTENDANCE] Attendance marked for userId=%s, date=%s', userId, meal_date);
-        res.json({ message: 'Attendance marked', attended: true });
+        // Persist attendance and prevent duplicates
+        const attendanceCheck = await pool.query(
+            'SELECT * FROM attendance WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
+            [email, adminPgId, meal_type, meal_date]
+        );
+        if (attendanceCheck.rows.length > 0) {
+                console.warn('[MARK ATTENDANCE] Attendance already marked for user:', email, 'meal_type:', meal_type, 'date:', meal_date);
+                return res.status(409).json({ message: 'Attendance already marked' });
+        }
+            await pool.query(
+                'INSERT INTO attendance (email, pg_id, meal_type, date) VALUES ($1, $2, $3, $4)',
+                [email, adminPgId, meal_type, meal_date]
+            );
+        console.log('[MARK ATTENDANCE] Attendance marked for user:', email, 'meal_type:', meal_type, 'date:', meal_date);
+            res.json({ message: 'Attendance marked' });
     } catch (error) {
         console.error('[MARK ATTENDANCE] Internal server error:', error.message);
         res.status(500).json({ error: 'Internal server error' });

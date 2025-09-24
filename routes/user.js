@@ -1,23 +1,86 @@
 
+
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/db');
 const authenticateToken = require('../middleware/authenticateToken');
 
+// Save or delete user meal enrollment (enroll/opt-out for a meal type and date)
+router.post('/meal-enrollment', authenticateToken, async (req, res) => {
+    const { meal_type, date, enrolled } = req.body;
+    const user_email = req.user.email;
+    console.log(`[MEAL ENROLLMENT] Request received: email=${user_email}, meal_type=${meal_type}, date=${date}, enrolled=${enrolled}`);
+    try {
+        // Get pg_id from enrollments
+        console.log(`[MEAL ENROLLMENT] Checking enrollment for user: ${user_email}`);
+        const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [user_email]);
+        console.log('[MEAL ENROLLMENT] Enrollment query result:', enrollmentResult.rows);
+        if (enrollmentResult.rows.length === 0) {
+            console.warn('[MEAL ENROLLMENT] User not enrolled in any PG:', user_email);
+            return res.status(403).json({ error: 'User not enrolled in any PG' });
+        }
+        const pg_id = enrollmentResult.rows[0].pg_id;
+
+        if (enrolled) {
+            // Enroll: insert entry
+            console.log(`[MEAL ENROLLMENT] Enrolling user: ${user_email} for meal_type=${meal_type}, date=${date}, pg_id=${pg_id}`);
+            await pool.query(
+                `INSERT INTO user_meal_enrollments (email, pg_id, meal_type, date)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT DO NOTHING`,
+                [user_email, pg_id, meal_type, date]
+            );
+            console.log(`[MEAL ENROLLMENT] Enrollment saved for user: ${user_email}, meal_type=${meal_type}, date=${date}`);
+                // Log all meals in which user has enrolled
+                const enrolledMeals = await pool.query(
+                    'SELECT meal_type, date FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2',
+                    [user_email, pg_id]
+                );
+                console.log(`[MEAL ENROLLMENT] User ${user_email} enrolled meals:`, enrolledMeals.rows);
+            res.json({ success: true, message: 'Meal enrollment saved', meal_type, date, enrolled });
+        } else {
+            // De-enroll: delete entry
+            console.log(`[MEAL ENROLLMENT] De-enrolling user: ${user_email} for meal_type=${meal_type}, date=${date}, pg_id=${pg_id}`);
+            await pool.query(
+                `DELETE FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4`,
+                [user_email, pg_id, meal_type, date]
+            );
+            console.log(`[MEAL ENROLLMENT] Enrollment removed for user: ${user_email}, meal_type=${meal_type}, date=${date}`);
+                // Log all meals in which user has enrolled
+                const enrolledMeals = await pool.query(
+                    'SELECT meal_type, date FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2',
+                    [user_email, pg_id]
+                );
+                console.log(`[MEAL ENROLLMENT] User ${user_email} enrolled meals:`, enrolledMeals.rows);
+            res.json({ success: true, message: 'Meal enrollment removed', meal_type, date, enrolled });
+        }
+        console.log(`[MEAL ENROLLMENT] Response sent for user: ${user_email}`);
+    } catch (err) {
+        console.error('[MEAL ENROLLMENT] Error:', err.message);
+        res.status(500).json({ error: 'Failed to save meal enrollment', details: err.message });
+    }
+});
 
 // Get meals assigned by the admin of the user's PG
 router.get('/assigned-meals', authenticateToken, async (req, res) => {
     const { email } = req.user;
+    console.log(`[ASSIGNED MEALS] Request received for user: ${email}`);
     try {
         // Get user's enrollment and PG
+        console.log('[ASSIGNED MEALS] Checking enrollment for user:', email);
         const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [email]);
+        console.log('[ASSIGNED MEALS] Enrollment query result:', enrollmentResult.rows);
         if (enrollmentResult.rows.length === 0) {
+            console.warn('[ASSIGNED MEALS] User not enrolled in any PG:', email);
             return res.status(403).json({ error: 'User not enrolled in any PG' });
         }
         const pg_id = enrollmentResult.rows[0].pg_id;
+        console.log(`[ASSIGNED MEALS] Fetching meals for PG: ${pg_id}`);
         // Fetch meals assigned to this PG
-        const mealsResult = await pool.query('SELECT * FROM meals WHERE pg_id = $1', [pg_id]);
+        const mealsResult = await pool.query('SELECT * FROM meal_menus WHERE pg_id = $1', [pg_id]);
+        console.log(`[ASSIGNED MEALS] Meals query result for PG ${pg_id}:`, mealsResult.rows);
         res.json({ meals: mealsResult.rows });
+        console.log(`[ASSIGNED MEALS] Response sent for user: ${email}`);
     } catch (err) {
         console.error('[ASSIGNED MEALS] Error:', err.message);
         res.status(500).json({ error: 'Failed to fetch assigned meals', details: err.message });
