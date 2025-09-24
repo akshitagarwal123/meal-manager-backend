@@ -61,6 +61,33 @@ router.post('/meal-enrollment', authenticateToken, async (req, res) => {
     }
 });
 
+// Add endpoint to get meal enrollment status for a user
+router.get('/meal-enrollment-status', authenticateToken, async (req, res) => {
+    const { meal_type, date } = req.query;
+    const user_email = req.user.email;
+    console.log(`[MEAL ENROLLMENT STATUS] Request received: email=${user_email}, meal_type=${meal_type}, date=${date}`);
+    try {
+        // Get user's PG
+        const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [user_email]);
+        console.log('[MEAL ENROLLMENT STATUS] Enrollment query result:', enrollmentResult.rows);
+        if (enrollmentResult.rows.length === 0) {
+            console.warn('[MEAL ENROLLMENT STATUS] User not enrolled in any PG:', user_email);
+            return res.status(403).json({ error: 'User not enrolled in any PG' });
+        }
+        const pg_id = enrollmentResult.rows[0].pg_id;
+        // Check enrollment for this meal
+        const result = await pool.query(
+            'SELECT * FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
+            [user_email, pg_id, meal_type, date]
+        );
+        console.log(`[MEAL ENROLLMENT STATUS] Enrollment check for user=${user_email}, meal_type=${meal_type}, date=${date}:`, result.rows);
+        res.json({ enrolled: result.rows.length > 0 });
+    } catch (err) {
+        console.error('[MEAL ENROLLMENT STATUS] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch meal enrollment status', details: err.message });
+    }
+});
+
 // Get meals assigned by the admin of the user's PG
 router.get('/assigned-meals', authenticateToken, async (req, res) => {
     const { email } = req.user;
@@ -377,3 +404,29 @@ router.post('/enroll', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
+// Add endpoint to get meal enrollment status for a user
+router.get('/meal-enrollment-status', authenticateToken, async (req, res) => {
+    const { meal_type, date } = req.query;
+    const user_email = req.user.email;
+    console.log(`[MEAL ENROLLMENT STATUS] Request received: email=${user_email}, meal_type=${meal_type}, date=${date}`);
+    try {
+        // Get user's PG
+        const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [user_email]);
+        console.log('[MEAL ENROLLMENT STATUS] Enrollment query result:', enrollmentResult.rows);
+        if (enrollmentResult.rows.length === 0) {
+            console.warn('[MEAL ENROLLMENT STATUS] User not enrolled in any PG:', user_email);
+            return res.status(403).json({ error: 'User not enrolled in any PG' });
+        }
+        const pg_id = enrollmentResult.rows[0].pg_id;
+        // Check enrollment for this meal
+        const result = await pool.query(
+            'SELECT * FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
+            [user_email, pg_id, meal_type, date]
+        );
+        console.log(`[MEAL ENROLLMENT STATUS] Enrollment check for user=${user_email}, meal_type=${meal_type}, date=${date}:`, result.rows);
+        res.json({ enrolled: result.rows.length > 0 });
+    } catch (err) {
+        console.error('[MEAL ENROLLMENT STATUS] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch meal enrollment status', details: err.message });
+    }
+});

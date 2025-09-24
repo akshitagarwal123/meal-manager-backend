@@ -389,3 +389,25 @@ router.get('/enrolled-users', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
+// Get count of users enrolled for each meal type and date for a given PG (admin)
+router.get('/meal-enrollment-counts', authenticateToken, async (req, res) => {
+    const adminPgId = req.user && req.user.pg_id;
+    const pg_id = req.query.pg_id || adminPgId;
+    if (!pg_id) {
+        return res.status(400).json({ error: 'PG ID is required (query param or JWT)' });
+    }
+    try {
+        const countsResult = await pool.query(
+            `SELECT meal_type, date, COUNT(*) AS enrolled_count
+             FROM user_meal_enrollments
+             WHERE pg_id = $1
+             GROUP BY meal_type, date
+             ORDER BY date DESC, meal_type ASC`,
+            [pg_id]
+        );
+        res.json({ counts: countsResult.rows });
+    } catch (err) {
+        console.error('[ADMIN MEAL ENROLLMENT COUNTS] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch meal enrollment counts', details: err.message });
+    }
+});
