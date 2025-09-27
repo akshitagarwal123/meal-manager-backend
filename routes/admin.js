@@ -1,9 +1,201 @@
+
+
+
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const { sendPushNotification } = require('../utils/notifications');
+const { getISTDateString } = require('../utils/date');
 const authenticateToken = require('../middleware/authenticateToken');
+
+module.exports = router;
+
+
+// GET /admin/meal-enrollment-counts
+// Get count of users enrolled for each meal type and date for a given PG (admin)
+// Optional: pass ?date=YYYY-MM-DD to get for a specific date, otherwise defaults to today (IST)
+router.get('/meal-enrollment-counts', authenticateToken, async (req, res) => {
+    const adminPgId = req.user && req.user.pg_id;
+    const pg_id = req.query.pg_id || adminPgId;
+    let { date } = req.query;
+    if (!pg_id) {
+        return res.status(400).json({ error: 'PG ID is required (query param or JWT)' });
+    }
+    if (date) {
+        // If date is provided, return counts for that date only
+        try {
+            const countsResult = await pool.query(
+                `SELECT meal_type, COUNT(*) AS enrolled_count
+                 FROM user_meal_enrollments
+                 WHERE pg_id = $1 AND date = $2
+                 GROUP BY meal_type
+                 ORDER BY meal_type ASC`,
+                [pg_id, date]
+            );
+            res.json({ date, counts: countsResult.rows });
+        } catch (err) {
+            console.error('[ADMIN MEAL ENROLLMENT COUNTS] Error:', err.message);
+            res.status(500).json({ error: 'Failed to fetch meal enrollment counts', details: err.message });
+        }
+    } else {
+        // No date param: return counts for today (IST)
+        const todayIST = getISTDateString();
+        try {
+            const countsResult = await pool.query(
+                `SELECT meal_type, COUNT(*) AS enrolled_count
+                 FROM user_meal_enrollments
+                 WHERE pg_id = $1 AND date = $2
+                 GROUP BY meal_type
+                 ORDER BY meal_type ASC`,
+                [pg_id, todayIST]
+            );
+            res.json({ date: todayIST, counts: countsResult.rows });
+        } catch (err) {
+            console.error('[ADMIN MEAL ENROLLMENT COUNTS] Error:', err.message);
+            res.status(500).json({ error: 'Failed to fetch meal enrollment counts', details: err.message });
+        }
+    }
+});
+
+
+// Admin: Get total QR scans for today (optionally for a PG)
+router.get('/qr-scans/today', authenticateToken, async (req, res) => {
+    try {
+        const adminPgId = req.user && req.user.pg_id;
+        const pg_id = req.query.pg_id || adminPgId;
+        // Build base query using IST date
+        const todayIST = getISTDateString();
+
+        let params = [todayIST];
+        let whereClause = 'WHERE date = $1';
+        if (pg_id) {
+            params.push(pg_id);
+            whereClause += ' AND pg_id = $2';
+        }
+
+        console.log(`[QR SCANS] Fetching QR scan counts for IST date=${todayIST}, pg_id=${pg_id || 'ALL'}`);
+
+        // Total scans
+        const totalResult = await pool.query(
+            `SELECT COUNT(*)::int AS total FROM attendance ${whereClause}`,
+            params
+        );
+
+        // Breakdown by meal_type
+        const breakdownResult = await pool.query(
+            `SELECT meal_type, COUNT(*)::int AS count FROM attendance ${whereClause} GROUP BY meal_type`,
+            params
+        );
+
+        console.log(`[QR SCANS] Results for IST date=${todayIST}, pg_id=${pg_id || 'ALL'}: total=${totalResult.rows[0].total}, breakdown=${JSON.stringify(breakdownResult.rows)}`);
+
+        res.json({ date: todayIST, pg_id: pg_id || null, total: totalResult.rows[0].total, breakdown: breakdownResult.rows });
+    } catch (err) {
+        console.error('[ADMIN QR SCANS TODAY] Error:', err.message);
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
+});
+
+
+// Admin: Send meal notification to users enrolled for a specific meal type and date
+router.post('/send-meal-notification', authenticateToken, async (req, res) => {
+    /*
+        Request body: {
+            pg_id: number,
+            meal_type: string,
+            date: string (YYYY-MM-DD),
+            title: string,
+            body: string
+        }
+    */
+    try {
+        const { pg_id, meal_type, date, title, body } = req.body;
+        if (!pg_id || !meal_type || !date || !title || !body) {
+            return res.status(400).json({ error: 'pg_id, meal_type, date, title, and body are required.' });
+        }
+
+        // Fetch users enrolled for this meal type and date in the PG
+        const usersResult = await pool.query(
+            `SELECT u.email, u.name, u.device_token FROM users u
+             INNER JOIN user_meal_enrollments ume ON ume.user_id = u.id
+             WHERE ume.pg_id = $1 AND ume.meal_type = $2 AND ume.date = $3 AND ume.enrolled = true AND u.device_token IS NOT NULL`,
+            [pg_id, meal_type, date]
+        );
+
+        if (usersResult.rows.length === 0) {
+            return res.status(404).json({ error: 'No enrolled users with device tokens found for this meal.' });
+        }
+
+        let successCount = 0;
+        let failCount = 0;
+        for (const user of usersResult.rows) {
+            try {
+                await sendPushNotification(user.device_token, title, body);
+                console.log(`[MEAL NOTIFICATION] Sent to ${user.email} (${user.name || ''}) for ${meal_type} on ${date}`);
+                successCount++;
+            } catch (err) {
+                console.warn(`[MEAL NOTIFICATION] Failed for ${user.email}:`, err.message);
+                failCount++;
+            }
+        }
+
+        return res.json({ message: `Meal notification sent to ${successCount} users. Failed for ${failCount} users.` });
+    } catch (err) {
+        console.error('[MEAL NOTIFICATION] Error:', err);
+        return res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// Admin: Send custom notification to all PG members
+router.post('/send-custom-notification', authenticateToken, async (req, res) => {
+    /*
+        Request body: {
+            pg_id: number,
+            title: string,
+            body: string
+        }
+    */
+    try {
+        const { pg_id, title, body } = req.body;
+        if (!pg_id || !title || !body) {
+            return res.status(400).json({ error: 'pg_id, title, and body are required.' });
+        }
+
+        // Fetch all users enrolled in this PG (using enrollments table)
+        const usersResult = await pool.query(
+            `SELECT u.email, u.name, u.device_token FROM users u
+             INNER JOIN enrollments e ON e.user_id = u.id
+             WHERE e.pg_id = $1 AND u.device_token IS NOT NULL`,
+            [pg_id]
+        );
+
+        if (usersResult.rows.length === 0) {
+            return res.status(404).json({ error: 'No users with device tokens found for this PG.' });
+        }
+
+        let successCount = 0;
+        let failCount = 0;
+        for (const user of usersResult.rows) {
+            try {
+                await sendPushNotification(user.device_token, title, body);
+                console.log(`[CUSTOM NOTIFICATION] Sent to ${user.email} (${user.name || ''}) for PG ${pg_id}`);
+                successCount++;
+            } catch (err) {
+                console.warn(`[CUSTOM NOTIFICATION] Failed for ${user.email}:`, err.message);
+                failCount++;
+            }
+        }
+
+        return res.json({ message: `Notification sent to ${successCount} users. Failed for ${failCount} users.` });
+    } catch (err) {
+        console.error('[CUSTOM NOTIFICATION] Error:', err);
+        return res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
+// Get count of users enrolled for each meal type and date for a given PG (admin)
+
 
 
 // Save or update device token for the authenticated admin
@@ -216,6 +408,29 @@ router.post('/approve-enrollment', authenticateToken, async (req, res) => {
         if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Pending enrollment not found for this user and PG' });
         }
+            // Send push notification to the user
+            try {
+                // Get user email and device token
+                const userEmailResult = await pool.query('SELECT email, name, device_token FROM users WHERE id = $1', [user_id]);
+                // Fetch PG name
+                const pgResult = await pool.query('SELECT name FROM pgs WHERE id = $1', [pg_id]);
+                const pgName = pgResult.rows.length > 0 ? pgResult.rows[0].name : `PG ${pg_id}`;
+                if (userEmailResult.rows.length > 0) {
+                    const user = userEmailResult.rows[0];
+                    if (user.device_token) {
+                        const title = 'Enrollment Approved';
+                        const body = `Hi ${user.name || user.email}, your enrollment for ${pgName} has been approved!`;
+                        await sendPushNotification(user.device_token, title, body);
+                        console.log(`[APPROVE ENROLLMENT] Notification sent to user (${user.email}) for PG ${pgName}`);
+                    } else {
+                        console.warn(`[APPROVE ENROLLMENT] User (${user.email}) has no device token, notification not sent.`);
+                    }
+                } else {
+                    console.warn(`[APPROVE ENROLLMENT] No user found for id: ${user_id}, notification not sent.`);
+                }
+            } catch (notifyErr) {
+                console.error(`[APPROVE ENROLLMENT] Error sending notification to user (${user_id}):`, notifyErr.message);
+            }
         res.json({ success: true, message: 'Enrollment approved', enrollment: result.rows[0] });
     } catch (err) {
         console.error('[ADMIN] Error approving enrollment:', err.message);
@@ -286,9 +501,10 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
         }
 
 
-        // Get today's date
-        const meal_date = new Date().toISOString().slice(0, 10);
-        console.log(`[MARK ATTENDANCE] Meal date: ${meal_date}`);
+
+    // Get today's date in IST
+    const meal_date = getISTDateString();
+    console.log(`[MARK ATTENDANCE] Meal date (IST): ${meal_date}`);
 
         // Check if user is enrolled for this meal type and date
         const mealEnrollResult = await pool.query(
@@ -332,7 +548,7 @@ router.post('/login', async (req, res) => {
             console.log('[ADMIN LOGIN] Invalid credentials');
             return res.status(401).json({ error: 'Invalid credentials' });
         }
-        const token = jwt.sign({ adminId: admin.id, role: 'admin' }, process.env.JWT_SECRET, { expiresIn: '1d' });
+    const token = jwt.sign({ adminId: admin.id, role: 'admin', username: admin.username }, process.env.JWT_SECRET, { expiresIn: '1d' });
         // Return pg_id along with token
         console.log(`[ADMIN LOGIN] Success: adminId=${admin.id}, token=${token}, pg_id=${admin.pg_id}`);
         res.json({ token, pg_id: admin.pg_id });
@@ -385,29 +601,5 @@ router.get('/enrolled-users', authenticateToken, async (req, res) => {
     } catch (err) {
         console.error('[ADMIN] Error fetching enrolled users:', err.message);
         res.status(500).json({ error: 'Server error', details: err.message });
-    }
-});
-
-module.exports = router;
-// Get count of users enrolled for each meal type and date for a given PG (admin)
-router.get('/meal-enrollment-counts', authenticateToken, async (req, res) => {
-    const adminPgId = req.user && req.user.pg_id;
-    const pg_id = req.query.pg_id || adminPgId;
-    if (!pg_id) {
-        return res.status(400).json({ error: 'PG ID is required (query param or JWT)' });
-    }
-    try {
-        const countsResult = await pool.query(
-            `SELECT meal_type, date, COUNT(*) AS enrolled_count
-             FROM user_meal_enrollments
-             WHERE pg_id = $1
-             GROUP BY meal_type, date
-             ORDER BY date DESC, meal_type ASC`,
-            [pg_id]
-        );
-        res.json({ counts: countsResult.rows });
-    } catch (err) {
-        console.error('[ADMIN MEAL ENROLLMENT COUNTS] Error:', err.message);
-        res.status(500).json({ error: 'Failed to fetch meal enrollment counts', details: err.message });
     }
 });

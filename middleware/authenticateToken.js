@@ -13,7 +13,9 @@ function authenticateToken(req, res, next) {
       console.warn('[AUTH] Invalid or expired token:', err.message);
       return res.sendStatus(403);
     }
-    console.log('[AUTH] Token valid for user:', user.email || user.username);
+    // Log user identity for both user and admin tokens
+    const identity = user.email || user.username || user.adminId || user.role || 'unknown';
+    console.log('[AUTH] Token valid for user:', identity);
     req.user = user;
     next();
   });
