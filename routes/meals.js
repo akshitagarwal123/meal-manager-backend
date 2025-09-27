@@ -13,13 +13,25 @@ router.get('/menu', authenticateToken, async (req, res) => {
         return res.status(400).json({ error: 'pg_id and date are required as query params' });
     }
     try {
+        const user_email = req.user.email;
         console.log('[GET MEAL MENU] Querying meal_menus table');
         const result = await pool.query(
-            'SELECT meal_type, items FROM meal_menus WHERE pg_id = $1 AND date = $2',
+            'SELECT meal_type, items, date FROM meal_menus WHERE pg_id = $1 AND date = $2',
             [pg_id, date]
         );
         console.log('[GET MEAL MENU] Meals found:', result.rows.length);
-        const response = { meals: result.rows };
+        // For each meal, fetch the user's enrollment status
+        const mealsWithStatus = await Promise.all(result.rows.map(async meal => {
+            const enrollResult = await pool.query(
+                'SELECT enrolled FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
+                [user_email, pg_id, meal.meal_type, date]
+            );
+            return {
+                ...meal,
+                enrolled: enrollResult.rows.length > 0 ? enrollResult.rows[0].enrolled : undefined
+            };
+        }));
+        const response = { meals: mealsWithStatus };
         console.log('[GET MEAL MENU] Response:', JSON.stringify(response));
         res.json(response);
     } catch (err) {
@@ -47,32 +59,44 @@ router.post('/menu', authenticateToken, async (req, res) => {
         );
         console.log('[SAVE MEAL MENU] Upserted meal:', upsert.rows[0]);
 
-        // Send meal menu notification to all PG members with device tokens
+        // Enroll all users in the PG for this meal/date by default (enrolled=true) if not already present
         try {
             const usersResult = await pool.query(
-                `SELECT u.email, u.name, u.device_token FROM users u
+                `SELECT u.id, u.email, u.name, u.device_token FROM users u
                  INNER JOIN enrollments e ON e.user_id = u.id
-                 WHERE e.pg_id = $1 AND u.device_token IS NOT NULL`,
+                 WHERE e.pg_id = $1`,
                 [pg_id]
             );
             if (usersResult.rows.length > 0) {
+                for (const user of usersResult.rows) {
+                    // Insert only if not already present
+                    await pool.query(
+                        `INSERT INTO user_meal_enrollments (user_id, pg_id, email, date, meal_type, enrolled, created_at)
+                         VALUES ($1, $2, $3, $4, $5, true, NOW())
+                         ON CONFLICT (user_id, pg_id, date, meal_type) DO NOTHING`,
+                        [user.id, pg_id, user.email, date, meal_type]
+                    );
+                }
+                // Send meal menu notification to all PG members with device tokens
                 const title = `Meal Menu Updated: ${meal_type}`;
                 const body = `Today's menu: ${items.join(', ')}`;
                 let successCount = 0;
                 let failCount = 0;
                 for (const user of usersResult.rows) {
-                    try {
-                        await require('../utils/notifications').sendPushNotification(user.device_token, title, body);
-                        console.log(`[MEAL MENU NOTIFICATION] Sent to ${user.email} (${user.name || ''}) for ${meal_type} on ${date}`);
-                        successCount++;
-                    } catch (err) {
-                        console.warn(`[MEAL MENU NOTIFICATION] Failed for ${user.email}:`, err.message);
-                        failCount++;
+                    if (user.device_token) {
+                        try {
+                            await require('../utils/notifications').sendPushNotification(user.device_token, title, body);
+                            console.log(`[MEAL MENU NOTIFICATION] Sent to ${user.email} (${user.name || ''}) for ${meal_type} on ${date}`);
+                            successCount++;
+                        } catch (err) {
+                            console.warn(`[MEAL MENU NOTIFICATION] Failed for ${user.email}:`, err.message);
+                            failCount++;
+                        }
                     }
                 }
                 console.log(`[MEAL MENU NOTIFICATION] Sent to ${successCount} users. Failed for ${failCount} users.`);
             } else {
-                console.log('[MEAL MENU NOTIFICATION] No PG members with device tokens found.');
+                console.log('[MEAL MENU NOTIFICATION] No PG members found.');
             }
         } catch (notifyErr) {
             console.error('[MEAL MENU NOTIFICATION] Error:', notifyErr.message);

@@ -21,39 +21,22 @@ router.post('/meal-enrollment', authenticateToken, async (req, res) => {
         }
         const pg_id = enrollmentResult.rows[0].pg_id;
 
-        if (enrolled) {
-            // Enroll: insert entry
-            console.log(`[MEAL ENROLLMENT] Enrolling user: ${user_email} for meal_type=${meal_type}, date=${date}, pg_id=${pg_id}`);
-            await pool.query(
-                `INSERT INTO user_meal_enrollments (email, pg_id, meal_type, date)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT DO NOTHING`,
-                [user_email, pg_id, meal_type, date]
-            );
-            console.log(`[MEAL ENROLLMENT] Enrollment saved for user: ${user_email}, meal_type=${meal_type}, date=${date}`);
-                // Log all meals in which user has enrolled
-                const enrolledMeals = await pool.query(
-                    'SELECT meal_type, date FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2',
-                    [user_email, pg_id]
-                );
-                console.log(`[MEAL ENROLLMENT] User ${user_email} enrolled meals:`, enrolledMeals.rows);
-            res.json({ success: true, message: 'Meal enrollment saved', meal_type, date, enrolled });
-        } else {
-            // De-enroll: delete entry
-            console.log(`[MEAL ENROLLMENT] De-enrolling user: ${user_email} for meal_type=${meal_type}, date=${date}, pg_id=${pg_id}`);
-            await pool.query(
-                `DELETE FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4`,
-                [user_email, pg_id, meal_type, date]
-            );
-            console.log(`[MEAL ENROLLMENT] Enrollment removed for user: ${user_email}, meal_type=${meal_type}, date=${date}`);
-                // Log all meals in which user has enrolled
-                const enrolledMeals = await pool.query(
-                    'SELECT meal_type, date FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2',
-                    [user_email, pg_id]
-                );
-                console.log(`[MEAL ENROLLMENT] User ${user_email} enrolled meals:`, enrolledMeals.rows);
-            res.json({ success: true, message: 'Meal enrollment removed', meal_type, date, enrolled });
-        }
+        // Always upsert: set enrolled true or false
+        console.log(`[MEAL ENROLLMENT] Setting enrolled=${enrolled} for user: ${user_email}, meal_type=${meal_type}, date=${date}, pg_id=${pg_id}`);
+        await pool.query(
+            `INSERT INTO user_meal_enrollments (email, pg_id, meal_type, date, enrolled, created_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())
+             ON CONFLICT (email, pg_id, meal_type, date)
+             DO UPDATE SET enrolled = $5`,
+            [user_email, pg_id, meal_type, date, enrolled]
+        );
+        // Log all meals in which user has enrolled
+        const enrolledMeals = await pool.query(
+            'SELECT meal_type, date, enrolled FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2',
+            [user_email, pg_id]
+        );
+        console.log(`[MEAL ENROLLMENT] User ${user_email} meal enrollments:`, enrolledMeals.rows);
+        res.json({ success: true, message: 'Meal enrollment updated', meal_type, date, enrolled });
         console.log(`[MEAL ENROLLMENT] Response sent for user: ${user_email}`);
     } catch (err) {
         console.error('[MEAL ENROLLMENT] Error:', err.message);
@@ -106,8 +89,21 @@ router.get('/assigned-meals', authenticateToken, async (req, res) => {
         // Fetch meals assigned to this PG
         const mealsResult = await pool.query('SELECT * FROM meal_menus WHERE pg_id = $1', [pg_id]);
         console.log(`[ASSIGNED MEALS] Meals query result for PG ${pg_id}:`, mealsResult.rows);
-        res.json({ meals: mealsResult.rows });
-        console.log(`[ASSIGNED MEALS] Response sent for user: ${email}`);
+        // For each meal, fetch the user's enrollment status
+        const mealsWithStatus = await Promise.all(mealsResult.rows.map(async meal => {
+            const enrollResult = await pool.query(
+                'SELECT enrolled FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
+                [email, pg_id, meal.meal_type, meal.date]
+            );
+            return {
+                ...meal,
+                enrolled: enrollResult.rows.length > 0 ? enrollResult.rows[0].enrolled : undefined
+            };
+        }));
+    const response = { meals: mealsWithStatus };
+    console.log('[ASSIGNED MEALS] Response:', JSON.stringify(response));
+    res.json(response);
+    console.log(`[ASSIGNED MEALS] Response sent for user: ${email}`);
     } catch (err) {
         console.error('[ASSIGNED MEALS] Error:', err.message);
         res.status(500).json({ error: 'Failed to fetch assigned meals', details: err.message });
