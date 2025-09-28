@@ -1,3 +1,25 @@
+// GET /admin/notifications - fetch notifications for the authenticated admin
+router.get('/notifications', authenticateToken, async (req, res) => {
+    const adminId = req.user && (req.user.adminId || req.user.id);
+    if (!adminId) {
+        return res.status(401).json({ error: 'Unauthorized: adminId missing' });
+    }
+    try {
+        const result = await pool.query(
+            `SELECT id, title, message, sent_at, type, read
+             FROM notifications
+             WHERE admin_id = $1
+             ORDER BY sent_at DESC
+             LIMIT 100`,
+            [adminId]
+        );
+        res.json({ notifications: result.rows });
+    } catch (err) {
+        console.error('[ADMIN NOTIFICATIONS] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch notifications', details: err.message });
+    }
+});
+
 
 
 
@@ -7,50 +29,194 @@ const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const { sendPushNotification } = require('../utils/notifications');
 const { getISTDateString } = require('../utils/date');
+const mealEndTimes = require('../config/mealEndTimes');
+const { isMealOver } = require('../utils/mealTime');
 const authenticateToken = require('../middleware/authenticateToken');
 
 module.exports = router;
+
+
+// Add logs for meal-enrollment-details endpoint
+router.get('/meal-enrollment-details', authenticateToken, async (req, res) => {
+    const adminPgId = req.user && req.user.pg_id;
+    const pg_id = req.query.pg_id || adminPgId;
+    const { date, meal_type } = req.query;
+    console.log(`[MEAL ENROLLMENT DETAILS] Request received: pg_id=${pg_id}, date=${date}, meal_type=${meal_type}`);
+    if (!pg_id || !date || !meal_type) {
+        console.warn('[MEAL ENROLLMENT DETAILS] Missing required query params');
+        return res.status(400).json({ error: 'pg_id, date, and meal_type are required as query params' });
+    }
+    try {
+        // Enrolled users (enrolled = true)
+    const enrolledSQL = `SELECT u.id AS user_id, u.name, u.email, u.phone
+         FROM user_meal_enrollments ume
+         JOIN users u ON ume.user_id = u.id
+         WHERE ume.pg_id = $1 AND ume.date = $2 AND ume.meal_type = $3 AND ume.enrolled = true`;
+        console.log('[MEAL ENROLLMENT DETAILS] Enrolled SQL:', enrolledSQL);
+        const enrolledResult = await pool.query(enrolledSQL, [pg_id, date, meal_type]);
+        console.log(`[MEAL ENROLLMENT DETAILS] Enrolled users count: ${enrolledResult.rows.length}`);
+
+        // Opted out users (enrolled = false)
+    const optedOutSQL = `SELECT u.id AS user_id, u.name, u.email, u.phone
+         FROM user_meal_enrollments ume
+         JOIN users u ON ume.user_id = u.id
+         WHERE ume.pg_id = $1 AND ume.date = $2 AND ume.meal_type = $3 AND ume.enrolled = false`;
+        console.log('[MEAL ENROLLMENT DETAILS] Opted out SQL:', optedOutSQL);
+        const optedOutResult = await pool.query(optedOutSQL, [pg_id, date, meal_type]);
+        console.log(`[MEAL ENROLLMENT DETAILS] Opted out users count: ${optedOutResult.rows.length}`);
+
+        // No-shows: enrolled but no attendance
+                const noShowSQL = `SELECT u.id AS user_id, u.name, u.email, u.phone
+                         FROM user_meal_enrollments ume
+                         JOIN users u ON ume.user_id = u.id
+                         WHERE ume.pg_id = $1 AND ume.date = $2 AND ume.meal_type = $3 AND ume.enrolled = true
+                         AND NOT EXISTS (
+                                 SELECT 1 FROM attendance a
+                                 WHERE a.email = ume.email
+                                     AND a.pg_id = ume.pg_id
+                                     AND a.meal_type = ume.meal_type
+                                     AND a.date = ume.date
+                         )`;
+        console.log('[MEAL ENROLLMENT DETAILS] No-show SQL:', noShowSQL);
+        const noShowResult = await pool.query(noShowSQL, [pg_id, date, meal_type]);
+        console.log(`[MEAL ENROLLMENT DETAILS] No-show users count: ${noShowResult.rows.length}`);
+
+        const response = {
+            enrolled: enrolledResult.rows,
+            opted_out: optedOutResult.rows,
+            no_show: noShowResult.rows
+        };
+        console.log('[MEAL ENROLLMENT DETAILS] Final response:', JSON.stringify(response, null, 2));
+        res.json(response);
+    } catch (err) {
+        console.error('[ADMIN MEAL ENROLLMENT DETAILS] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch meal enrollment details', details: err.message });
+    }
+});
+
+
+// GET /admin/meal-enrollment-details
+// Returns detailed lists of users: enrolled, opted out, and no-shows for a given meal type, date, and PG
+router.get('/meal-enrollment-details', authenticateToken, async (req, res) => {
+    const adminPgId = req.user && req.user.pg_id;
+    const pg_id = req.query.pg_id || adminPgId;
+    const { date, meal_type } = req.query;
+    if (!pg_id || !date || !meal_type) {
+        return res.status(400).json({ error: 'pg_id, date, and meal_type are required as query params' });
+    }
+    try {
+        // Enrolled users (enrolled = true)
+        const enrolledResult = await pool.query(
+            `SELECT u.id, u.name, u.email, u.phone
+             FROM user_meal_enrollments ume
+             JOIN users u ON ume.user_id = u.id
+             WHERE ume.pg_id = $1 AND ume.date = $2 AND ume.meal_type = $3 AND ume.enrolled = true`,
+            [pg_id, date, meal_type]
+        );
+
+        // Opted out users (enrolled = false)
+        const optedOutResult = await pool.query(
+            `SELECT u.id, u.name, u.email, u.phone
+             FROM user_meal_enrollments ume
+             JOIN users u ON ume.user_id = u.id
+             WHERE ume.pg_id = $1 AND ume.date = $2 AND ume.meal_type = $3 AND ume.enrolled = false`,
+            [pg_id, date, meal_type]
+        );
+
+        // No-shows: enrolled but no attendance
+        const noShowResult = await pool.query(
+            `SELECT u.id, u.name, u.email, u.phone
+             FROM user_meal_enrollments ume
+             JOIN users u ON ume.user_id = u.id
+             WHERE ume.pg_id = $1 AND ume.date = $2 AND ume.meal_type = $3 AND ume.enrolled = true
+             AND NOT EXISTS (
+                 SELECT 1 FROM attendance a
+                 WHERE a.email = ume.email
+                   AND a.pg_id = ume.pg_id
+                   AND a.meal_type = ume.meal_type
+                   AND a.date = ume.date
+             )`,
+            [pg_id, date, meal_type]
+        );
+
+        res.json({
+            enrolled: enrolledResult.rows,
+            opted_out: optedOutResult.rows,
+            no_show: noShowResult.rows
+        });
+    } catch (err) {
+        console.error('[ADMIN MEAL ENROLLMENT DETAILS] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch meal enrollment details', details: err.message });
+    }
+});
 
 
 // GET /admin/meal-enrollment-counts
 // Get count of users enrolled for each meal type and date for a given PG (admin)
 // Optional: pass ?date=YYYY-MM-DD to get for a specific date, otherwise defaults to today (IST)
 router.get('/meal-enrollment-counts', authenticateToken, async (req, res) => {
+    // Declare all variables at the top
     const adminPgId = req.user && req.user.pg_id;
     const pg_id = req.query.pg_id || adminPgId;
     let { date } = req.query;
     if (!pg_id) {
         return res.status(400).json({ error: 'PG ID is required (query param or JWT)' });
     }
+    console.log(`[MEAL ENROLLMENT COUNTS] Request received: pg_id=${pg_id}, date=${date || 'today (IST)'}`);
+    console.log(`[MEAL ENROLLMENT COUNTS] Query params:`, req.query);
+
+    // Helper function to get counts for a given date
+    async function getCounts(targetDate) {
+        const sql = `SELECT ume.meal_type,
+                    COUNT(*) FILTER (WHERE ume.enrolled = true) AS enrolled_count,
+                    COUNT(*) FILTER (WHERE ume.enrolled = false) AS opted_out_count,
+                    COUNT(*) FILTER (
+                        WHERE ume.enrolled = true
+                        AND NOT EXISTS (
+                            SELECT 1 FROM attendance a
+                            WHERE a.email = ume.email
+                              AND a.pg_id = ume.pg_id
+                              AND a.meal_type = ume.meal_type
+                              AND a.date = ume.date
+                        )
+                    ) AS no_show_count
+             FROM user_meal_enrollments ume
+             WHERE ume.pg_id = $1 AND ume.date = $2
+             GROUP BY ume.meal_type
+             ORDER BY ume.meal_type ASC`;
+        console.log(`[MEAL ENROLLMENT COUNTS] Executing SQL:`, sql);
+        console.log(`[MEAL ENROLLMENT COUNTS] SQL params:`, [pg_id, targetDate]);
+        const countsResult = await pool.query(sql, [pg_id, targetDate]);
+        console.log(`[MEAL ENROLLMENT COUNTS] Raw DB result:`, countsResult.rows);
+        // For each meal type, only show no_show_count if meal is over
+        return countsResult.rows.map(row => {
+            const endTime = mealEndTimes[row.meal_type];
+            const mealOver = endTime && isMealOver(row.meal_type, targetDate, endTime);
+            console.log(`[MEAL ENROLLMENT COUNTS] meal_type=${row.meal_type}, date=${targetDate}, endTime=${endTime}, mealOver=${mealOver}, enrolled_count=${row.enrolled_count}, opted_out_count=${row.opted_out_count}, no_show_count=${row.no_show_count}`);
+            if (!endTime || !mealOver) {
+                console.log(`[MEAL ENROLLMENT COUNTS] Hiding no_show_count for meal_type=${row.meal_type} (meal not over)`);
+                return { ...row, no_show_count: null };
+            }
+            console.log(`[MEAL ENROLLMENT COUNTS] Showing no_show_count for meal_type=${row.meal_type}`);
+            return row;
+        });
+    }
+
     if (date) {
-        // If date is provided, return counts for that date only
         try {
-            const countsResult = await pool.query(
-                `SELECT meal_type, COUNT(*) AS enrolled_count
-                 FROM user_meal_enrollments
-                 WHERE pg_id = $1 AND date = $2
-                 GROUP BY meal_type
-                 ORDER BY meal_type ASC`,
-                [pg_id, date]
-            );
-            res.json({ date, counts: countsResult.rows });
+            const counts = await getCounts(date);
+            console.log(`[MEAL ENROLLMENT COUNTS] Final response for date=${date}:`, JSON.stringify(counts, null, 2));
+            res.json({ date, counts });
         } catch (err) {
             console.error('[ADMIN MEAL ENROLLMENT COUNTS] Error:', err.message);
             res.status(500).json({ error: 'Failed to fetch meal enrollment counts', details: err.message });
         }
     } else {
-        // No date param: return counts for today (IST)
         const todayIST = getISTDateString();
         try {
-            const countsResult = await pool.query(
-                `SELECT meal_type, COUNT(*) AS enrolled_count
-                 FROM user_meal_enrollments
-                 WHERE pg_id = $1 AND date = $2
-                 GROUP BY meal_type
-                 ORDER BY meal_type ASC`,
-                [pg_id, todayIST]
-            );
-            res.json({ date: todayIST, counts: countsResult.rows });
+            const counts = await getCounts(todayIST);
+            console.log(`[MEAL ENROLLMENT COUNTS] Final response for date=${todayIST}:`, JSON.stringify(counts, null, 2));
+            res.json({ date: todayIST, counts });
         } catch (err) {
             console.error('[ADMIN MEAL ENROLLMENT COUNTS] Error:', err.message);
             res.status(500).json({ error: 'Failed to fetch meal enrollment counts', details: err.message });
@@ -147,86 +313,6 @@ router.post('/send-meal-notification', authenticateToken, async (req, res) => {
     }
 });
 
-// Admin: Send custom notification to all PG members
-router.post('/send-custom-notification', authenticateToken, async (req, res) => {
-    /*
-        Request body: {
-            pg_id: number,
-            title: string,
-            body: string
-        }
-    */
-    try {
-        const { pg_id, title, body } = req.body;
-        if (!pg_id || !title || !body) {
-            return res.status(400).json({ error: 'pg_id, title, and body are required.' });
-        }
-
-        // Fetch all users enrolled in this PG (using enrollments table)
-        const usersResult = await pool.query(
-            `SELECT u.email, u.name, u.device_token FROM users u
-             INNER JOIN enrollments e ON e.user_id = u.id
-             WHERE e.pg_id = $1 AND u.device_token IS NOT NULL`,
-            [pg_id]
-        );
-
-        if (usersResult.rows.length === 0) {
-            return res.status(404).json({ error: 'No users with device tokens found for this PG.' });
-        }
-
-        let successCount = 0;
-        let failCount = 0;
-        for (const user of usersResult.rows) {
-            try {
-                await sendPushNotification(user.device_token, title, body);
-                console.log(`[CUSTOM NOTIFICATION] Sent to ${user.email} (${user.name || ''}) for PG ${pg_id}`);
-                successCount++;
-            } catch (err) {
-                console.warn(`[CUSTOM NOTIFICATION] Failed for ${user.email}:`, err.message);
-                failCount++;
-            }
-        }
-
-        return res.json({ message: `Notification sent to ${successCount} users. Failed for ${failCount} users.` });
-    } catch (err) {
-        console.error('[CUSTOM NOTIFICATION] Error:', err);
-        return res.status(500).json({ error: 'Internal server error.' });
-    }
-});
-
-// Get count of users enrolled for each meal type and date for a given PG (admin)
-
-
-
-// Save or update device token for the authenticated admin
-router.post('/saveDeviceToken', authenticateToken, async (req, res) => {
-    const { deviceToken } = req.body;
-    // Admin ID is available in JWT as adminId
-    const adminId = req.user && (req.user.adminId || req.user.id);
-    if (!deviceToken) {
-        console.warn('[ADMIN SAVE DEVICE TOKEN] deviceToken missing in request body');
-        return res.status(400).json({ error: 'deviceToken is required' });
-    }
-    if (!adminId) {
-        console.warn('[ADMIN SAVE DEVICE TOKEN] adminId missing in JWT');
-        return res.status(401).json({ error: 'Unauthorized: adminId missing' });
-    }
-    try {
-        const result = await pool.query(
-            'UPDATE admins SET device_token = $1 WHERE id = $2 RETURNING *',
-            [deviceToken, adminId]
-        );
-        if (result.rowCount === 0) {
-            console.warn('[ADMIN SAVE DEVICE TOKEN] Admin not found for id:', adminId);
-            return res.status(404).json({ error: 'Admin not found' });
-        }
-        console.log('[ADMIN SAVE DEVICE TOKEN] Device token updated for adminId=%s', adminId);
-        res.json({ success: true, message: 'Device token updated', admin: result.rows[0] });
-    } catch (err) {
-        console.error('[ADMIN SAVE DEVICE TOKEN] Error:', err.message);
-        res.status(500).json({ error: 'Server error', details: err.message });
-    }
-});
 
 // Admin endpoint to decline a user's enrollment to a PG
 router.post('/decline-enrollment', authenticateToken, async (req, res) => {

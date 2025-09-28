@@ -1,3 +1,30 @@
+// GET /user/notifications - fetch notifications for the authenticated user
+router.get('/notifications', authenticateToken, async (req, res) => {
+    const userEmail = req.user && req.user.email;
+    if (!userEmail) {
+        return res.status(401).json({ error: 'Unauthorized: user email missing' });
+    }
+    try {
+        // Get user_id from users table
+        const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [userEmail]);
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        const userId = userResult.rows[0].id;
+        const result = await pool.query(
+            `SELECT id, title, message, sent_at, type, read
+             FROM notifications
+             WHERE user_id = $1
+             ORDER BY sent_at DESC
+             LIMIT 100`,
+            [userId]
+        );
+        res.json({ notifications: result.rows });
+    } catch (err) {
+        console.error('[USER NOTIFICATIONS] Error:', err.message);
+        res.status(500).json({ error: 'Failed to fetch notifications', details: err.message });
+    }
+});
 
 
 const express = require('express');
