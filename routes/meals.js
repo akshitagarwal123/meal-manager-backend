@@ -3,6 +3,7 @@ const router = express.Router();
 const pool = require('../config/db');
 const authenticateToken = require('../middleware/authenticateToken');
 const { getISTDateString } = require('../utils/date');
+const { broadcastToPG } = require('../services/notificationService');
 
 // Get meal menu for a PG and date
 router.get('/menu', authenticateToken, async (req, res) => {
@@ -77,24 +78,11 @@ router.post('/menu', authenticateToken, async (req, res) => {
                         [user.id, pg_id, user.email, date, meal_type]
                     );
                 }
-                // Send meal menu notification to all PG members with device tokens
+                // Send meal menu notification using notificationService
                 const title = `Meal Menu Updated: ${meal_type}`;
                 const body = `Today's menu: ${items.join(', ')}`;
-                let successCount = 0;
-                let failCount = 0;
-                for (const user of usersResult.rows) {
-                    if (user.device_token) {
-                        try {
-                            await require('../utils/notifications').sendPushNotification(user.device_token, title, body);
-                            console.log(`[MEAL MENU NOTIFICATION] Sent to ${user.email} (${user.name || ''}) for ${meal_type} on ${date}`);
-                            successCount++;
-                        } catch (err) {
-                            console.warn(`[MEAL MENU NOTIFICATION] Failed for ${user.email}:`, err.message);
-                            failCount++;
-                        }
-                    }
-                }
-                console.log(`[MEAL MENU NOTIFICATION] Sent to ${successCount} users. Failed for ${failCount} users.`);
+                await broadcastToPG({ pgId: pg_id, title, message: body, type: 'meal-menu' });
+                console.log(`[MEAL MENU NOTIFICATION] Notification sent to all PG members for ${meal_type} on ${date}`);
             } else {
                 console.log('[MEAL MENU NOTIFICATION] No PG members found.');
             }

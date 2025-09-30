@@ -8,9 +8,10 @@ const PORT = process.env.PORT || 3000;
 const userRoutes = require('./routes/user');
 app.use('/user', userRoutes);
 
-// Email OTP Auth routes
-const emailAuthRoutes = require('./routes/emailAuth');
-app.use('/email-auth', emailAuthRoutes);
+
+// Auth routes (OTP, login, etc.)
+const authRoutes = require('./routes/auth');
+app.use('/auth', authRoutes);
 
 
 // Admin routes

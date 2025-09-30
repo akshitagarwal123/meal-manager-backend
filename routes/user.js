@@ -1,3 +1,10 @@
+const express = require('express');
+const router = express.Router();
+const pool = require('../config/db');
+const authenticateToken = require('../middleware/authenticateToken');
+
+
+
 // GET /user/notifications - fetch notifications for the authenticated user
 router.get('/notifications', authenticateToken, async (req, res) => {
     const userEmail = req.user && req.user.email;
@@ -25,12 +32,6 @@ router.get('/notifications', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch notifications', details: err.message });
     }
 });
-
-
-const express = require('express');
-const router = express.Router();
-const pool = require('../config/db');
-const authenticateToken = require('../middleware/authenticateToken');
 
 // Save or delete user meal enrollment (enroll/opt-out for a meal type and date)
 router.post('/meal-enrollment', authenticateToken, async (req, res) => {
@@ -362,7 +363,7 @@ router.delete('/:id', async (req, res) => {
 });
 
 // User requests to enroll in a PG
-const { sendPushNotification } = require('../utils/notifications');
+const { notifyAdmin } = require('../services/notificationService');
 router.post('/enroll', authenticateToken, async (req, res) => {
     console.log('[ENROLL] Request body:', req.body);
     console.log('[ENROLL] User:', req.user);
@@ -385,33 +386,14 @@ router.post('/enroll', authenticateToken, async (req, res) => {
             [userId, email, pg_id]
         );
 
-        // Notify the admin of this PG
+        // Notify the admin of this PG using notificationService
         try {
-            // Find admin for this PG
             const adminResult = await pool.query('SELECT * FROM admins WHERE pg_id = $1 LIMIT 1', [pg_id]);
             if (adminResult.rows.length > 0) {
                 const admin = adminResult.rows[0];
-                // Get admin device token (if stored in admins table)
-                let adminDeviceToken = admin.device_token;
-                if (!adminDeviceToken) {
-                    // Try to get from users table if admin uses same email
-                    const adminUserResult = await pool.query('SELECT device_token FROM users WHERE email = $1', [admin.email]);
-                    if (adminUserResult.rows.length > 0) {
-                        adminDeviceToken = adminUserResult.rows[0].device_token;
-                    }
-                }
-                if (adminDeviceToken) {
-                    const title = 'New Enrollment Request';
-                    const body = `${userResult.rows[0].username || userResult.rows[0].name || email} requested to join your PG.`;
-                    try {
-                        await sendPushNotification(adminDeviceToken, title, body);
-                        console.log(`[ENROLL] Notification sent to admin (${admin.email}) for PG ${pg_id}`);
-                    } catch (pushErr) {
-                        console.error(`[ENROLL] Failed to send notification to admin (${admin.email}):`, pushErr.message);
-                    }
-                } else {
-                    console.warn(`[ENROLL] Admin for PG ${pg_id} has no device token, notification not sent.`);
-                }
+                const title = 'New Enrollment Request';
+                const message = `${userResult.rows[0].username || userResult.rows[0].name || email} requested to join your PG.`;
+                await notifyAdmin({ adminId: admin.id, title, message, type: 'enrollment' });
             } else {
                 console.warn(`[ENROLL] No admin found for PG ${pg_id}, notification not sent.`);
             }

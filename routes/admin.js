@@ -1,3 +1,21 @@
+
+
+
+
+const express = require('express');
+const router = express.Router();
+const jwt = require('jsonwebtoken');
+const pool = require('../config/db');
+const { sendPushNotification } = require('../utils/notifications');
+const { getISTDateString } = require('../utils/date');
+const mealEndTimes = require('../config/mealEndTimes');
+const { isMealOver } = require('../utils/mealTime');
+const authenticateToken = require('../middleware/authenticateToken');
+const { broadcastToPG } = require('../services/notificationService');
+
+module.exports = router;
+
+
 // GET /admin/notifications - fetch notifications for the authenticated admin
 router.get('/notifications', authenticateToken, async (req, res) => {
     const adminId = req.user && (req.user.adminId || req.user.id);
@@ -19,21 +37,6 @@ router.get('/notifications', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch notifications', details: err.message });
     }
 });
-
-
-
-
-const express = require('express');
-const router = express.Router();
-const jwt = require('jsonwebtoken');
-const pool = require('../config/db');
-const { sendPushNotification } = require('../utils/notifications');
-const { getISTDateString } = require('../utils/date');
-const mealEndTimes = require('../config/mealEndTimes');
-const { isMealOver } = require('../utils/mealTime');
-const authenticateToken = require('../middleware/authenticateToken');
-
-module.exports = router;
 
 
 // Add logs for meal-enrollment-details endpoint
@@ -293,11 +296,36 @@ router.post('/send-meal-notification', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'No enrolled users with device tokens found for this meal.' });
         }
 
+        const adminId = req.user && (req.user.adminId || req.user.id);
         let successCount = 0;
         let failCount = 0;
         for (const user of usersResult.rows) {
             try {
                 await sendPushNotification(user.device_token, title, body);
+                // Add detailed logging for DB insert
+                console.log('[MEAL NOTIFICATION][DB INSERT ATTEMPT]', {
+                    user_id: user.user_id || user.id,
+                    admin_id: adminId,
+                    title,
+                    body,
+                    type: 'meal'
+                });
+                try {
+                    await pool.query(
+                        `INSERT INTO notifications (user_id, admin_id, title, message, type, sent_at, read)
+                         VALUES ($1, $2, $3, $4, $5, NOW(), false)`,
+                        [user.user_id || user.id, adminId, title, body, 'meal']
+                    );
+                    console.log('[MEAL NOTIFICATION][DB INSERT SUCCESS]', user.user_id || user.id);
+                } catch (dbErr) {
+                    console.error('[MEAL NOTIFICATION][DB INSERT ERROR]', dbErr.message, {
+                        user_id: user.user_id || user.id,
+                        admin_id: adminId,
+                        title,
+                        body,
+                        type: 'meal'
+                    });
+                }
                 console.log(`[MEAL NOTIFICATION] Sent to ${user.email} (${user.name || ''}) for ${meal_type} on ${date}`);
                 successCount++;
             } catch (err) {
@@ -423,52 +451,16 @@ router.delete('/delete-user/:userId', authenticateToken, async (req, res) => {
     }
 });
 
-// Admin triggers push notifications to all users enrolled in a PG
+// Admin triggers push notifications to all users enrolled in a PG (refactored to use notificationService)
 router.post('/sendNotifications', authenticateToken, async (req, res) => {
-    // Extract notification details and PG ID from request body
     const { title, body, pg_id } = req.body;
-    // Log the incoming request
-    console.log(`[SEND NOTIFICATIONS] Request received: title="${title}", body="${body}", pg_id=${pg_id}`);
-
-    // Validate required fields
     if (!title || !body || !pg_id) {
-        console.warn('[SEND NOTIFICATIONS] Missing required fields in request body');
         return res.status(400).json({ error: 'title, body, and pg_id are required' });
     }
     try {
-        // Query device tokens for all users enrolled in the specified PG (status=2 means approved/enrolled)
-        console.log('[SEND NOTIFICATIONS] Fetching device tokens for enrolled users in PG:', pg_id);
-        const result = await pool.query(
-            `SELECT u.device_token FROM users u
-             JOIN enrollments e ON u.id = e.user_id
-             WHERE e.pg_id = $1 AND e.status = 2 AND u.device_token IS NOT NULL`,
-            [pg_id]
-        );
-        // Extract and filter device tokens
-        const deviceTokens = result.rows.map(row => row.device_token).filter(Boolean);
-        console.log(`[SEND NOTIFICATIONS] Found ${deviceTokens.length} device tokens.`);
-        if (deviceTokens.length === 0) {
-            // No device tokens found for enrolled users
-            console.warn('[SEND NOTIFICATIONS] No device tokens found for enrolled users in PG:', pg_id);
-            return res.status(404).json({ error: 'No device tokens found for enrolled users in this PG' });
-        }
-        let results = [];
-        // Send notification to each device token
-        for (const token of deviceTokens) {
-            try {
-                await sendPushNotification(token, title, body);
-                results.push({ token, status: 'sent' });
-            } catch (err) {
-                // Log and record any errors for individual tokens
-                console.error(`[SEND NOTIFICATIONS] Error sending to token ${token}:`, err.message);
-                results.push({ token, status: 'error', error: err.message });
-            }
-        }
-        // Log and return the results
-        console.log('[SEND NOTIFICATIONS] Notification results:', results);
-        res.json({ success: true, results });
+        await broadcastToPG({ pgId: pg_id, title, message: body, type: 'admin-broadcast' });
+        res.json({ success: true, message: 'Notifications sent to all enrolled users.' });
     } catch (err) {
-        // Log and return any server errors
         console.error('[SEND NOTIFICATIONS] Error sending push notifications:', err.message);
         res.status(500).json({ error: 'Failed to send notifications', details: err.message });
     }
@@ -507,6 +499,13 @@ router.post('/approve-enrollment', authenticateToken, async (req, res) => {
                         const title = 'Enrollment Approved';
                         const body = `Hi ${user.name || user.email}, your enrollment for ${pgName} has been approved!`;
                         await sendPushNotification(user.device_token, title, body);
+                        // Save notification in DB after successful send
+                        const adminId = req.user && (req.user.adminId || req.user.id);
+                        await pool.query(
+                            `INSERT INTO notifications (user_id, admin_id, title, message, type, sent_at, read)
+                             VALUES ($1, $2, $3, $4, $5, NOW(), false)`,
+                            [user_id, adminId, title, body, 'enrollment-approved']
+                        );
                         console.log(`[APPROVE ENROLLMENT] Notification sent to user (${user.email}) for PG ${pgName}`);
                     } else {
                         console.warn(`[APPROVE ENROLLMENT] User (${user.email}) has no device token, notification not sent.`);

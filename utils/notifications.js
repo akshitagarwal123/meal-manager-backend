@@ -7,7 +7,15 @@
  * @param {string} body - Notification body
  * @returns {Promise}
  */
-async function sendPushNotification(deviceToken, title, body) {
+/**
+ * Send a push notification to a device
+ * @param {string} deviceToken - FCM device token
+ * @param {string} title - Notification title
+ * @param {string} body - Notification body
+ * @param {string} [redirectUrl] - Optional redirect URL for deep linking
+ * @returns {Promise}
+ */
+async function sendPushNotification(deviceToken, title, body, redirectUrl) {
   if (!deviceToken) throw new Error('Missing deviceToken');
   if (!deviceToken.startsWith('ExponentPushToken')) {
     throw new Error('Only Expo push tokens are supported. FCM logic is disabled.');
@@ -19,6 +27,7 @@ async function sendPushNotification(deviceToken, title, body) {
     sound: 'default',
     title,
     body,
+    data: redirectUrl ? { redirectUrl } : undefined,
   };
 
   try {
