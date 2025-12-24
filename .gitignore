@@ -1,0 +1,4 @@
+node_modules/
+.env
+API_ENDPOINTS.md
+API_ENDPOINTS_DOC.md

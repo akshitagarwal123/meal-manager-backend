@@ -1,7 +1,3 @@
-
-
-
-
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
@@ -262,6 +258,105 @@ router.get('/qr-scans/today', authenticateToken, async (req, res) => {
         res.json({ date: todayIST, pg_id: pg_id || null, total: totalResult.rows[0].total, breakdown: breakdownResult.rows });
     } catch (err) {
         console.error('[ADMIN QR SCANS TODAY] Error:', err.message);
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
+});
+
+// Admin: Attendance summary for a date range (optionally for a PG)
+// GET /admin/qr-scans/summary?from=YYYY-MM-DD&to=YYYY-MM-DD&pg_id=...
+router.get('/qr-scans/summary', authenticateToken, async (req, res) => {
+    try {
+        const adminPgId = req.user && req.user.pg_id;
+        const pg_id = req.query.pg_id || adminPgId;
+        const from = req.query.from;
+        const to = req.query.to;
+
+        if (!from || !to) {
+            return res.status(400).json({ error: 'from and to are required (YYYY-MM-DD)' });
+        }
+
+        let params = [from, to];
+        let whereClause = 'WHERE date >= $1 AND date <= $2';
+        if (pg_id) {
+            params.push(pg_id);
+            whereClause += ` AND pg_id = $${params.length}`;
+        }
+
+        const grouped = await pool.query(
+            `SELECT date, meal_type, COUNT(*)::int AS count
+             FROM attendance
+             ${whereClause}
+             GROUP BY date, meal_type
+             ORDER BY date ASC`,
+            params
+        );
+
+        const totalResult = await pool.query(
+            `SELECT COUNT(*)::int AS total FROM attendance ${whereClause}`,
+            params
+        );
+
+        const byDateMap = {};
+        for (const row of grouped.rows) {
+            const date = row.date;
+            const meal_type = row.meal_type;
+            const count = row.count;
+            if (!byDateMap[date]) {
+                byDateMap[date] = { date, total: 0, breakdown: {} };
+            }
+            byDateMap[date].breakdown[meal_type] = count;
+            byDateMap[date].total += count;
+        }
+
+        const byDate = Object.values(byDateMap);
+
+        res.json({
+            from,
+            to,
+            pg_id: pg_id || null,
+            total: totalResult.rows[0]?.total ?? 0,
+            byDate
+        });
+    } catch (err) {
+        console.error('[ADMIN QR SCANS SUMMARY] Error:', err.message);
+        res.status(500).json({ error: 'Server error', details: err.message });
+    }
+});
+
+// Admin: Attendance details for a given date + meal_type (optionally for a PG)
+// GET /admin/qr-scans/details?date=YYYY-MM-DD&meal_type=breakfast|lunch|dinner&pg_id=...
+router.get('/qr-scans/details', authenticateToken, async (req, res) => {
+    try {
+        const adminPgId = req.user && req.user.pg_id;
+        const pg_id = req.query.pg_id || adminPgId;
+        const date = req.query.date || getISTDateString();
+        const meal_type = req.query.meal_type;
+
+        if (!meal_type) {
+            return res.status(400).json({ error: 'meal_type is required' });
+        }
+
+        let params = [date, meal_type];
+        let whereClause = 'WHERE a.date = $1 AND a.meal_type = $2';
+        if (pg_id) {
+            params.push(pg_id);
+            whereClause += ` AND a.pg_id = $${params.length}`;
+        }
+
+        const result = await pool.query(
+            `SELECT a.email,
+                    COALESCE(u.name, '') AS name,
+                    COALESCE(u.phone, '') AS phone
+             FROM attendance a
+             LEFT JOIN users u ON u.email = a.email
+             ${whereClause}
+             ORDER BY COALESCE(u.name, a.email) ASC`,
+            params
+        );
+
+        res.json({ date, meal_type, pg_id: pg_id || null, attendees: result.rows });
+    } catch (err) {
+        console.error('[ADMIN QR SCANS DETAILS] Error:', err.message);
         res.status(500).json({ error: 'Server error', details: err.message });
     }
 });
@@ -587,9 +682,26 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
 
 
 
-    // Get today's date in IST
+        // Get today's date in IST
     const meal_date = getISTDateString();
     console.log(`[MARK ATTENDANCE] Meal date (IST): ${meal_date}`);
+
+        // Block attendance if this meal is marked as holiday for today.
+        try {
+            const menuRes = await pool.query(
+                `SELECT COALESCE(status, 'open') AS status
+                 FROM meal_menus
+                 WHERE pg_id = $1 AND date = $2 AND meal_type = $3
+                 LIMIT 1`,
+                [adminPgId, meal_date, meal_type]
+            );
+            const menuStatus = menuRes.rows?.[0]?.status;
+            if (menuStatus === 'holiday') {
+                return res.status(409).json({ error: 'Meal is marked as holiday' });
+            }
+        } catch (e) {
+            console.warn('[MARK ATTENDANCE] Unable to validate meal menu status:', e?.message || e);
+        }
 
         // Check if user is enrolled for this meal type and date
         const mealEnrollResult = await pool.query(

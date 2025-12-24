@@ -55,19 +55,46 @@ router.post('/send-otp', async (req, res) => {
   try {
     await pool.query('INSERT INTO email_otps (email, otp, expires_at) VALUES ($1, $2, $3)', [email, otp, expiresAt]);
     console.log(`[SEND OTP] OTP inserted for ${email}, OTP: ${otp}`);
-    await transporter.sendMail({
+    const mailPromise = transporter.sendMail({
       from: process.env.EMAIL_USER,
       to: email,
       subject: 'Your OTP for Meal Manager',
-      text: `Your OTP is ${otp}. It is valid for 5 minutes.`
+      text: `Your OTP is ${otp}. It is valid for 5 minutes.`,
     });
+
+    // Avoid hanging the request forever when SMTP/DNS is flaky (common on hotspots).
+    const timeoutMs = Number(process.env.OTP_EMAIL_TIMEOUT_MS || 15000);
+    await Promise.race([
+      mailPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('OTP email timeout')), timeoutMs)),
+    ]);
+
     console.log(`[SEND OTP] Email sent to ${email}`);
-  const response = { success: true, message: 'OTP sent to email' };
-  console.log('[SEND OTP] Response:', response);
-  res.json(response);
+    const response = { success: true, message: 'OTP sent to email' };
+    console.log('[SEND OTP] Response:', response);
+    res.json(response);
   } catch (err) {
+    const details = err?.message || String(err);
     console.error(`[SEND OTP] Error for ${email}:`, err);
-    res.status(500).json({ error: 'Failed to send OTP', details: err.message });
+
+    // Dev fallback: return OTP in response if email couldn't be sent.
+    const allowFallback =
+      process.env.ALLOW_DEV_OTP === 'true' ||
+      (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'prod');
+
+    if (allowFallback) {
+      const response = {
+        success: true,
+        message: 'OTP generated (email delivery unavailable on this network)',
+        otp,
+        emailDelivery: 'failed',
+        details,
+      };
+      console.log('[SEND OTP] Response (fallback):', response);
+      return res.json(response);
+    }
+
+    res.status(500).json({ error: 'Failed to send OTP', details });
   }
 });
 
@@ -104,5 +131,6 @@ router.post('/verify-otp', async (req, res) => {
     res.status(500).json({ error: 'Failed to verify OTP', details: err.message });
   }
 });
+
 
 module.exports = router;

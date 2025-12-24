@@ -3,22 +3,28 @@ const { Pool } = require('pg');
 
 // Use Render's DATABASE_URL if available, fallback to local config
 let pool;
-// if (process.env.DATABASE_URL) {
-//   console.log('Using Render DATABASE_URL for DB connection');
-//   pool = new Pool({
-//     connectionString: process.env.DATABASE_URL,
-//     ssl: { rejectUnauthorized: false },
-//   });
-// } else {
-  console.log('Using local DB config');
+if (process.env.DATABASE_URL) {
+  console.log('Using DATABASE_URL for DB connection');
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+  });
+} else {
+  const host = process.env.PGHOST || 'localhost';
+  const useSsl =
+    process.env.PGSSL === 'true' ||
+    process.env.PGSSLMODE === 'require' ||
+    !['localhost', '127.0.0.1'].includes(host);
+
+  console.log(`Using DB config (host=${host}, ssl=${useSsl ? 'on' : 'off'})`);
   pool = new Pool({
     user: process.env.PGUSER || 'postgres',
-    host: process.env.PGHOST || 'localhost',
+    host,
     database: process.env.PGDATABASE || 'meal_manager',
     password: process.env.PGPASSWORD || 'password',
     port: process.env.PGPORT || 5432,
-    // ssl: { rejectUnauthorized: false },
+    ...(useSsl ? { ssl: { rejectUnauthorized: false } } : {}),
   });
-// }
+}
 
 module.exports = pool;

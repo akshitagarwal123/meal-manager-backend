@@ -33,72 +33,6 @@ router.get('/notifications', authenticateToken, async (req, res) => {
     }
 });
 
-// Save or delete user meal enrollment (enroll/opt-out for a meal type and date)
-router.post('/meal-enrollment', authenticateToken, async (req, res) => {
-    const { meal_type, date, enrolled } = req.body;
-    const user_email = req.user.email;
-    console.log(`[MEAL ENROLLMENT] Request received: email=${user_email}, meal_type=${meal_type}, date=${date}, enrolled=${enrolled}`);
-    try {
-        // Get pg_id from enrollments
-        console.log(`[MEAL ENROLLMENT] Checking enrollment for user: ${user_email}`);
-        const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [user_email]);
-        console.log('[MEAL ENROLLMENT] Enrollment query result:', enrollmentResult.rows);
-        if (enrollmentResult.rows.length === 0) {
-            console.warn('[MEAL ENROLLMENT] User not enrolled in any PG:', user_email);
-            return res.status(403).json({ error: 'User not enrolled in any PG' });
-        }
-        const pg_id = enrollmentResult.rows[0].pg_id;
-
-        // Always upsert: set enrolled true or false
-        console.log(`[MEAL ENROLLMENT] Setting enrolled=${enrolled} for user: ${user_email}, meal_type=${meal_type}, date=${date}, pg_id=${pg_id}`);
-        await pool.query(
-            `INSERT INTO user_meal_enrollments (email, pg_id, meal_type, date, enrolled, created_at)
-             VALUES ($1, $2, $3, $4, $5, NOW())
-             ON CONFLICT (email, pg_id, meal_type, date)
-             DO UPDATE SET enrolled = $5`,
-            [user_email, pg_id, meal_type, date, enrolled]
-        );
-        // Log all meals in which user has enrolled
-        const enrolledMeals = await pool.query(
-            'SELECT meal_type, date, enrolled FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2',
-            [user_email, pg_id]
-        );
-        console.log(`[MEAL ENROLLMENT] User ${user_email} meal enrollments:`, enrolledMeals.rows);
-        res.json({ success: true, message: 'Meal enrollment updated', meal_type, date, enrolled });
-        console.log(`[MEAL ENROLLMENT] Response sent for user: ${user_email}`);
-    } catch (err) {
-        console.error('[MEAL ENROLLMENT] Error:', err.message);
-        res.status(500).json({ error: 'Failed to save meal enrollment', details: err.message });
-    }
-});
-
-// Add endpoint to get meal enrollment status for a user
-router.get('/meal-enrollment-status', authenticateToken, async (req, res) => {
-    const { meal_type, date } = req.query;
-    const user_email = req.user.email;
-    console.log(`[MEAL ENROLLMENT STATUS] Request received: email=${user_email}, meal_type=${meal_type}, date=${date}`);
-    try {
-        // Get user's PG
-        const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [user_email]);
-        console.log('[MEAL ENROLLMENT STATUS] Enrollment query result:', enrollmentResult.rows);
-        if (enrollmentResult.rows.length === 0) {
-            console.warn('[MEAL ENROLLMENT STATUS] User not enrolled in any PG:', user_email);
-            return res.status(403).json({ error: 'User not enrolled in any PG' });
-        }
-        const pg_id = enrollmentResult.rows[0].pg_id;
-        // Check enrollment for this meal
-        const result = await pool.query(
-            'SELECT * FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
-            [user_email, pg_id, meal_type, date]
-        );
-        console.log(`[MEAL ENROLLMENT STATUS] Enrollment check for user=${user_email}, meal_type=${meal_type}, date=${date}:`, result.rows);
-        res.json({ enrolled: result.rows.length > 0 });
-    } catch (err) {
-        console.error('[MEAL ENROLLMENT STATUS] Error:', err.message);
-        res.status(500).json({ error: 'Failed to fetch meal enrollment status', details: err.message });
-    }
-});
-
 // Get meals assigned by the admin of the user's PG
 router.get('/assigned-meals', authenticateToken, async (req, res) => {
     const { email } = req.user;
@@ -276,29 +210,44 @@ router.get('/pgs', authenticateToken, async (req, res) => {
 	}
 });
 
-// User enrolls or opts out for a meal
-router.post('/meal-response', async (req, res) => {
-	const { email, meal_id, enrolled } = req.body;
-	try {
-		// Find user by email
-		const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-		if (userResult.rows.length === 0) {
-			return res.status(404).json({ error: 'User not found' });
-		}
-		const userId = userResult.rows[0].id;
-
-		// Insert or update meal response
-		await pool.query(
-			'INSERT INTO meal_responses (user_id, meal_id, enrolled) VALUES ($1, $2, $3) ON CONFLICT (user_id, meal_id) DO UPDATE SET enrolled = $3',
-			[userId, meal_id, enrolled]
-		);
-		res.json({ message: 'Meal response recorded', enrolled });
-	} catch (err) {
-		res.status(500).json({ error: 'Server error', details: err.message });
-	}
+// Update user profile details by email
+router.put('/update-details', async (req, res) => {
+  const { email, phone, username } = req.body;
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required to identify the user.' });
+  }
+  try {
+    // Check for duplicate phone (excluding current user)
+    if (phone) {
+      const duplicate = await pool.query(
+        'SELECT * FROM users WHERE phone = $1 AND email != $2',
+        [phone, email]
+      );
+      if (duplicate.rows.length > 0) {
+        return res.status(409).json({ error: 'Phone already exists' });
+      }
+    }
+    // Update user details
+    const fields = [];
+    const values = [];
+    let idx = 1;
+    if (username) { fields.push(`name = $${idx++}`); values.push(username); }
+    if (phone) { fields.push(`phone = $${idx++}`); values.push(phone); }
+    if (fields.length === 0) {
+      return res.status(400).json({ error: 'No fields to update.' });
+    }
+    values.push(email);
+    const query = `UPDATE users SET ${fields.join(', ')} WHERE email = $${idx} RETURNING *`;
+    const result = await pool.query(query, values);
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error('[UPDATE DETAILS] Error:', err.message);
+    res.status(500).json({ error: 'Failed to update user details', details: err.message });
+  }
 });
-
-
 
 // Get user profile
 router.get('/:id', async (req, res) => {
@@ -316,22 +265,53 @@ router.get('/:id', async (req, res) => {
 
 // Create user
 router.post('/create-user', async (req, res) => {
-    const { username, email, phone, pg_id, deviceToken } = req.body;
-    // Generate a 6-digit UUID (numeric string)
-    const id = Math.floor(100000 + Math.random() * 900000).toString();
+    const { username, email, phone, pg_id } = req.body;
+    const deviceToken = req.body.device_token ?? req.body.deviceToken;
+    if (!username || !email || !phone) {
+        return res.status(400).json({ error: 'username, email, and phone are required' });
+    }
     try {
-        let query, params;
-        if (pg_id) {
-            query = 'INSERT INTO users (id, username, email, phone, pg_id, device_token) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *';
-            params = [id, username, email, phone, pg_id, deviceToken];
-        } else {
-            query = 'INSERT INTO users (id, username, email, phone, device_token) VALUES ($1, $2, $3, $4, $5) RETURNING *';
-            params = [id, username, email, phone, deviceToken];
+        const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+        if (existingUser.rows.length > 0) {
+            return res.status(409).json({ error: 'Email already exists' });
         }
-        const result = await pool.query(query, params);
-        res.status(201).json(result.rows[0]);
+
+        const existingPhone = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
+        if (existingPhone.rows.length > 0) {
+            return res.status(409).json({ error: 'Phone already exists' });
+        }
+
+        const fields = ['name', 'email', 'phone'];
+        const placeholders = ['$1', '$2', '$3'];
+        const values = [username, email, phone];
+
+        if (pg_id !== undefined) {
+            fields.push('pg_id');
+            placeholders.push(`$${fields.length}`);
+            values.push(pg_id);
+        }
+
+        if (deviceToken !== undefined) {
+            fields.push('device_token');
+            placeholders.push(`$${fields.length}`);
+            values.push(deviceToken);
+        }
+
+        const insertQuery = `INSERT INTO users (${fields.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING id, name, email, phone, pg_id, device_token`;
+        const result = await pool.query(insertQuery, values);
+        const user = result.rows[0];
+
+        return res.status(201).json({
+            id: user.id,
+            username: user.name,
+            email: user.email,
+            phone: user.phone,
+            pg_id: user.pg_id ?? null,
+            device_token: user.device_token ?? null
+        });
     } catch (err) {
-        res.status(500).json({ error: 'Server error', details: err.message });
+        console.error('[CREATE USER] Error:', err.message);
+        return res.status(500).json({ error: 'Server error', details: err.message });
     }
 });
 
@@ -409,29 +389,3 @@ router.post('/enroll', authenticateToken, async (req, res) => {
 });
 
 module.exports = router;
-// Add endpoint to get meal enrollment status for a user
-router.get('/meal-enrollment-status', authenticateToken, async (req, res) => {
-    const { meal_type, date } = req.query;
-    const user_email = req.user.email;
-    console.log(`[MEAL ENROLLMENT STATUS] Request received: email=${user_email}, meal_type=${meal_type}, date=${date}`);
-    try {
-        // Get user's PG
-        const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [user_email]);
-        console.log('[MEAL ENROLLMENT STATUS] Enrollment query result:', enrollmentResult.rows);
-        if (enrollmentResult.rows.length === 0) {
-            console.warn('[MEAL ENROLLMENT STATUS] User not enrolled in any PG:', user_email);
-            return res.status(403).json({ error: 'User not enrolled in any PG' });
-        }
-        const pg_id = enrollmentResult.rows[0].pg_id;
-        // Check enrollment for this meal
-        const result = await pool.query(
-            'SELECT * FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
-            [user_email, pg_id, meal_type, date]
-        );
-        console.log(`[MEAL ENROLLMENT STATUS] Enrollment check for user=${user_email}, meal_type=${meal_type}, date=${date}:`, result.rows);
-        res.json({ enrolled: result.rows.length > 0 });
-    } catch (err) {
-        console.error('[MEAL ENROLLMENT STATUS] Error:', err.message);
-        res.status(500).json({ error: 'Failed to fetch meal enrollment status', details: err.message });
-    }
-});

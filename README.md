@@ -17,6 +17,18 @@ This is a Node.js backend for the Meal Manager app using Express.js.
    npm run dev
    ```
 
+## Using With Expo Go (Physical Phone)
+
+If your mobile app runs in Expo Go on a real device, it cannot reach your backend via `http://localhost:3000`.
+
+1. Start the backend bound to all interfaces:
+   ```bash
+   HOST=0.0.0.0 PORT=3000 npm start
+   ```
+2. In the mobile app, set the API base URL to your Mac's LAN IP:
+   - Example: `http://192.168.1.23:3000`
+   - Find your Mac IP (common): `ipconfig getifaddr en0`
+
 ## API Endpoints
 
 - `GET /` - Health check

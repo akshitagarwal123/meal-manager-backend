@@ -17,7 +17,11 @@ router.get('/menu', authenticateToken, async (req, res) => {
         const user_email = req.user.email;
         console.log('[GET MEAL MENU] Querying meal_menus table');
         const result = await pool.query(
-            'SELECT meal_type, items, date FROM meal_menus WHERE pg_id = $1 AND date = $2',
+            `SELECT meal_type, items, date,
+                    COALESCE(status, 'open') AS status,
+                    note
+             FROM meal_menus
+             WHERE pg_id = $1 AND date = $2`,
             [pg_id, date]
         );
         console.log('[GET MEAL MENU] Meals found:', result.rows.length);
@@ -43,20 +47,26 @@ router.get('/menu', authenticateToken, async (req, res) => {
 
 // Save or update meal menu for a PG, date, and meal_type
 router.post('/menu', authenticateToken, async (req, res) => {
-    const { pg_id, date, meal_type, items } = req.body;
-    console.log(`[SAVE MEAL MENU] Request received: pg_id=${pg_id}, date=${date}, meal_type=${meal_type}, items=${JSON.stringify(items)}`);
-    if (!pg_id || !date || !meal_type || !Array.isArray(items)) {
+    const { pg_id, date, meal_type } = req.body;
+    const status = String(req.body?.status || 'open').toLowerCase();
+    const note = req.body?.note ? String(req.body.note) : null;
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    console.log(`[SAVE MEAL MENU] Request received: pg_id=${pg_id}, date=${date}, meal_type=${meal_type}, status=${status}, items=${JSON.stringify(items)}`);
+    if (!pg_id || !date || !meal_type) {
         console.warn('[SAVE MEAL MENU] Missing required fields in request body');
-        return res.status(400).json({ error: 'pg_id, date, meal_type, and items[] are required' });
+        return res.status(400).json({ error: 'pg_id, date, and meal_type are required' });
+    }
+    if (!['open', 'holiday'].includes(status)) {
+        return res.status(400).json({ error: 'status must be open or holiday' });
     }
     try {
         console.log('[SAVE MEAL MENU] Upserting meal menu');
         const upsert = await pool.query(
-            `INSERT INTO meal_menus (pg_id, date, meal_type, items) VALUES ($1, $2, $3, $4)
+            `INSERT INTO meal_menus (pg_id, date, meal_type, items, status, note) VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (pg_id, date, meal_type)
-             DO UPDATE SET items = $4, updated_at = NOW()
+             DO UPDATE SET items = $4, status = $5, note = $6, updated_at = NOW()
              RETURNING *`,
-            [pg_id, date, meal_type, JSON.stringify(items)]
+            [pg_id, date, meal_type, JSON.stringify(items), status, note]
         );
         console.log('[SAVE MEAL MENU] Upserted meal:', upsert.rows[0]);
 
@@ -79,8 +89,11 @@ router.post('/menu', authenticateToken, async (req, res) => {
                     );
                 }
                 // Send meal menu notification using notificationService
-                const title = `Meal Menu Updated: ${meal_type}`;
-                const body = `Today's menu: ${items.join(', ')}`;
+                const title = status === 'holiday' ? `Holiday: ${meal_type}` : `Meal Menu Updated: ${meal_type}`;
+                const body =
+                    status === 'holiday'
+                        ? `No service for ${meal_type}${note ? ` (${note})` : ''}.`
+                        : `Today's menu: ${items.join(', ')}`;
                 await broadcastToPG({ pgId: pg_id, title, message: body, type: 'meal-menu' });
                 console.log(`[MEAL MENU NOTIFICATION] Notification sent to all PG members for ${meal_type} on ${date}`);
             } else {
