@@ -5,6 +5,10 @@ app.use(express.json()); // <-- Parse JSON bodies before routes
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 
+// Request/response logs (console) with X-Request-Id.
+const requestLogger = require('./middleware/requestLogger');
+app.use(requestLogger);
+
 // Basic CORS support for mobile/dev usage.
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -22,8 +26,6 @@ app.use('/user', userRoutes);
 // Auth routes (OTP, login, etc.)
 const authRoutes = require('./routes/auth');
 app.use('/auth', authRoutes);
-// Backward-compatible alias for older clients still calling /email-auth/*
-app.use('/email-auth', authRoutes);
 
 
 // Admin routes
@@ -37,17 +39,23 @@ app.use('/meals', mealsRoutes);
 
 
 app.get('/', (req, res) => {
-  res.send('Meal Manager Backend is running!');
+  res.json({ ok: true, message: 'Backend is running' });
 });
 
 // Simple ping endpoint for health check
 app.get('/ping', (req, res) => {
-  res.status(200).send('pong');
+  res.status(200).json({ ok: true, message: 'pong' });
 });
 
-// Sample route for meals
-app.get('/meals', (req, res) => {
-  res.json({ meals: [] }); // Placeholder for meal data
+// JSON 404 + error handler (avoid HTML errors for the Expo app).
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+app.use((err, req, res, next) => {
+  console.error('[UNHANDLED ERROR]', err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 app.listen(PORT, HOST, () => {

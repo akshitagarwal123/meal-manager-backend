@@ -1,391 +1,479 @@
 const express = require('express');
-const router = express.Router();
 const pool = require('../config/db');
 const authenticateToken = require('../middleware/authenticateToken');
+const { getISTDateString } = require('../utils/date');
+const { writeAuditLog, getReqMeta } = require('../utils/audit');
+const { flowLog, mask } = require('../utils/flowLog');
 
+const router = express.Router();
 
+const MEAL_TYPES = ['breakfast', 'lunch', 'snacks', 'dinner'];
 
-// GET /user/notifications - fetch notifications for the authenticated user
-router.get('/notifications', authenticateToken, async (req, res) => {
-    const userEmail = req.user && req.user.email;
-    if (!userEmail) {
-        return res.status(401).json({ error: 'Unauthorized: user email missing' });
-    }
-    try {
-        // Get user_id from users table
-        const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [userEmail]);
-        if (userResult.rows.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-        const userId = userResult.rows[0].id;
-        const result = await pool.query(
-            `SELECT id, title, message, sent_at, type, read
-             FROM notifications
-             WHERE user_id = $1
-             ORDER BY sent_at DESC
-             LIMIT 100`,
-            [userId]
-        );
-        res.json({ notifications: result.rows });
-    } catch (err) {
-        console.error('[USER NOTIFICATIONS] Error:', err.message);
-        res.status(500).json({ error: 'Failed to fetch notifications', details: err.message });
-    }
-});
+async function getActiveHostelAssignment({ userId, date }) {
+  const result = await pool.query(
+    `SELECT hostel_id
+     FROM user_hostel_assignments
+     WHERE user_id = $1
+       AND start_date <= $2
+       AND (end_date IS NULL OR end_date >= $2)
+     ORDER BY start_date DESC
+     LIMIT 1`,
+    [userId, date]
+  );
+  return result.rows?.[0]?.hostel_id ?? null;
+}
 
-// Get meals assigned by the admin of the user's PG
-router.get('/assigned-meals', authenticateToken, async (req, res) => {
-    const { email } = req.user;
-    console.log(`[ASSIGNED MEALS] Request received for user: ${email}`);
-    try {
-        // Get user's enrollment and PG
-        console.log('[ASSIGNED MEALS] Checking enrollment for user:', email);
-        const enrollmentResult = await pool.query('SELECT pg_id FROM enrollments WHERE user_email = $1 AND status = 2', [email]);
-        console.log('[ASSIGNED MEALS] Enrollment query result:', enrollmentResult.rows);
-        if (enrollmentResult.rows.length === 0) {
-            console.warn('[ASSIGNED MEALS] User not enrolled in any PG:', email);
-            return res.status(403).json({ error: 'User not enrolled in any PG' });
-        }
-        const pg_id = enrollmentResult.rows[0].pg_id;
-        console.log(`[ASSIGNED MEALS] Fetching meals for PG: ${pg_id}`);
-        // Fetch meals assigned to this PG
-        const mealsResult = await pool.query('SELECT * FROM meal_menus WHERE pg_id = $1', [pg_id]);
-        console.log(`[ASSIGNED MEALS] Meals query result for PG ${pg_id}:`, mealsResult.rows);
-        // For each meal, fetch the user's enrollment status
-        const mealsWithStatus = await Promise.all(mealsResult.rows.map(async meal => {
-            const enrollResult = await pool.query(
-                'SELECT enrolled FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
-                [email, pg_id, meal.meal_type, meal.date]
-            );
-            return {
-                ...meal,
-                enrolled: enrollResult.rows.length > 0 ? enrollResult.rows[0].enrolled : undefined
-            };
-        }));
-    const response = { meals: mealsWithStatus };
-    console.log('[ASSIGNED MEALS] Response:', JSON.stringify(response));
-    res.json(response);
-    console.log(`[ASSIGNED MEALS] Response sent for user: ${email}`);
-    } catch (err) {
-        console.error('[ASSIGNED MEALS] Error:', err.message);
-        res.status(500).json({ error: 'Failed to fetch assigned meals', details: err.message });
-    }
-});
-
-// Update/save device token for the authenticated user
-router.post('/saveDeviceToken', authenticateToken, async (req, res) => {
-    const { deviceToken } = req.body;
-    const user_email = req.user.email;
-    console.log(`[SAVE DEVICE TOKEN] Request received: user_email=${user_email}, deviceToken=${deviceToken}`);
-    if (!deviceToken) {
-        console.warn('[SAVE DEVICE TOKEN] deviceToken missing in request body');
-        return res.status(400).json({ error: 'deviceToken is required' });
-    }
-    try {
-        // Update device_token for the user identified by email
-        const result = await pool.query(
-            'UPDATE users SET device_token = $1 WHERE email = $2 RETURNING *',
-            [deviceToken, user_email]
-        );
-        if (result.rowCount === 0) {
-            console.warn('[SAVE DEVICE TOKEN] User not found for email:', user_email);
-            return res.status(404).json({ error: 'User not found' });
-        }
-        console.log('[SAVE DEVICE TOKEN] Device token updated for user_email=%s', user_email);
-        res.json({ success: true, message: 'Device token updated', user: result.rows[0] });
-    } catch (err) {
-        console.error('[SAVE DEVICE TOKEN] Error:', err.message);
-        res.status(500).json({ error: 'Server error', details: err.message });
-    }
-});
-
-// User withdraws their pending enrollment request
-router.post('/withdraw-enrollment', authenticateToken, async (req, res) => {
-    const { pg_id } = req.body;
-    let user_id = req.user.id || req.user.user_id;
-    const user_email = req.user.email;
-    console.log(`[WITHDRAW ENROLLMENT] Request received: user_id=${user_id}, user_email=${user_email}, pg_id=${pg_id}`);
-    if ((!user_id && !user_email) || !pg_id) {
-        console.warn('[WITHDRAW ENROLLMENT] Missing user_id/user_email or pg_id');
-        return res.status(400).json({ error: 'pg_id is required in body and user must be authenticated' });
-    }
-    try {
-        // If user_id is not present, fetch it using email
-        if (!user_id && user_email) {
-            console.log('[WITHDRAW ENROLLMENT] Fetching user_id from DB using email:', user_email);
-            const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [user_email]);
-            if (userResult.rows.length === 0) {
-                console.warn('[WITHDRAW ENROLLMENT] No user found for email:', user_email);
-                return res.status(404).json({ error: 'User not found' });
-            }
-            user_id = userResult.rows[0].id;
-            console.log('[WITHDRAW ENROLLMENT] Found user_id:', user_id);
-        }
-        // Check if a pending enrollment exists
-        console.log('[WITHDRAW ENROLLMENT] Checking for pending enrollment...');
-        const checkResult = await pool.query(
-            `SELECT * FROM enrollments WHERE user_id = $1 AND pg_id = $2 AND status = 1`,
-            [user_id, pg_id]
-        );
-        if (checkResult.rowCount === 0) {
-            console.warn('[WITHDRAW ENROLLMENT] No pending enrollment found for user_id=%s, pg_id=%s', user_id, pg_id);
-            return res.status(404).json({ error: 'No pending enrollment found for this user and PG' });
-        }
-        // Delete the pending enrollment
-        console.log('[WITHDRAW ENROLLMENT] Deleting pending enrollment for user_id=%s, pg_id=%s', user_id, pg_id);
-        await pool.query(
-            `DELETE FROM enrollments WHERE user_id = $1 AND pg_id = $2 AND status = 1`,
-            [user_id, pg_id]
-        );
-        console.log('[WITHDRAW ENROLLMENT] Enrollment request withdrawn for user_id=%s, pg_id=%s', user_id, pg_id);
-        res.json({ success: true, message: 'Enrollment request withdrawn' });
-    } catch (err) {
-        console.error('[WITHDRAW ENROLLMENT] Error:', err.message);
-        res.status(500).json({ error: 'Server error', details: err.message });
-    }
-});
-
-
-
-
-// Check user enrollment status
-router.get('/check-status', authenticateToken, async (req, res) => {
-    const { email } = req.user; // Using email as userId
-    console.log(`[CHECK STATUS] Request received for email: ${email}`);
-    try {
-        // Check if user exists
-        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        if (userResult.rows.length === 0) {
-            console.warn(`[CHECK STATUS] User not found for email: ${email}`);
-            return res.status(404).json({ error: 'User not found' });
-        }
-        console.log(`[CHECK STATUS] User found:`, userResult.rows[0]);
-
-        // Check enrollment status
-        const enrollmentResult = await pool.query('SELECT * FROM enrollments WHERE user_email = $1', [email]);
-        if (enrollmentResult.rows.length === 0) {
-            console.log(`[CHECK STATUS] No enrollment found for email: ${email}`);
-            // Condition 1: User not enrolled in any PG
-            return res.json({ status: 0 });
-        }
-
-        const enrollment = enrollmentResult.rows[0];
-        console.log(`[CHECK STATUS] Enrollment found:`, enrollment);
-        if (enrollment.status === 1) {
-            // Condition 2: Waiting for approval
-            const pgDetails = await pool.query('SELECT * FROM pgs WHERE id = $1', [enrollment.pg_id]);
-            console.log(`[CHECK STATUS] Pending approval for PG:`, pgDetails.rows[0]);
-            return res.json({ status: 1, pgDetails: pgDetails.rows[0] });
-        }
-
-        if (enrollment.status === 2) {
-            // Condition 3: Enrolled in a PG
-            const pgDetails = await pool.query('SELECT * FROM pgs WHERE id = $1', [enrollment.pg_id]);
-            console.log(`[CHECK STATUS] User enrolled in PG:`, pgDetails.rows[0]);
-            return res.json({ status: 2 });
-        }
-
-        // Default case (should not occur)
-        console.error(`[CHECK STATUS] Invalid enrollment status for email: ${email}`);
-        return res.status(400).json({ error: 'Invalid enrollment status' });
-    } catch (error) {
-        console.error('[CHECK USER STATUS] Error:', error.message);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-
-
-
-// Get list of PGs for user selection after login
+// List hostels for selection (legacy path kept: /user/pgs).
 router.get('/pgs', authenticateToken, async (req, res) => {
-	try {
-		const result = await pool.query('SELECT id, name, address FROM pgs');
-		const response = { success: true, pgs: result.rows };
-		console.log('[GET PGs] Response:', response);
-		res.json(response);
-	} catch (err) {
-		console.error('[GET PGs] Error:', err);
-		res.status(500).json({ error: 'Failed to fetch PGs', details: err.message });
-	}
+  try {
+    flowLog('HOSTELS', 'List requested', { email: req.user?.email, college_id: req.query.college_id ?? req.user?.college_id ?? '' });
+    const collegeId = req.query.college_id || req.user?.college_id || null;
+    const params = [];
+    let where = 'WHERE is_active = true';
+    if (collegeId) {
+      params.push(collegeId);
+      where += ` AND college_id = $${params.length}`;
+    }
+
+    const result = await pool.query(
+      `SELECT id, hostel_code, name, address, college_id
+       FROM hostels
+       ${where}
+       ORDER BY name ASC`,
+      params
+    );
+
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: req.user?.id ?? null,
+      action: 'USER_LIST_HOSTELS',
+      entityType: 'college',
+      entityId: collegeId ?? 'all',
+      details: { ...getReqMeta(req), count: result.rows.length },
+    });
+    flowLog('HOSTELS', 'Returned', { count: result.rows.length });
+    res.json({ success: true, hostels: result.rows });
+  } catch (err) {
+    console.error('[GET HOSTELS] Error:', err.message);
+    flowLog('HOSTELS', 'Error', { error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: req.user?.id ?? null,
+      action: 'USER_LIST_HOSTELS_ERROR',
+      entityType: 'api',
+      entityId: '/user/pgs',
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    res.status(500).json({ error: 'Failed to fetch hostels', details: err.message });
+  }
 });
 
-// Update user profile details by email
-router.put('/update-details', async (req, res) => {
-  const { email, phone, username } = req.body;
-  if (!email) {
-    return res.status(400).json({ error: 'Email is required to identify the user.' });
-  }
+// Student updates their own profile (uses token email/id).
+router.put('/update-details', authenticateToken, async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const { name, phone, roll_no, room_no, device_token, is_active } = req.body || {};
+
   try {
-    // Check for duplicate phone (excluding current user)
-    if (phone) {
-      const duplicate = await pool.query(
-        'SELECT * FROM users WHERE phone = $1 AND email != $2',
-        [phone, email]
-      );
-      if (duplicate.rows.length > 0) {
-        return res.status(409).json({ error: 'Phone already exists' });
-      }
-    }
-    // Update user details
+    flowLog('UPDATE DETAILS', 'Request received', { email: req.user?.email });
+    req.log?.info('user.update_details.start', { user_id: userId });
     const fields = [];
     const values = [];
     let idx = 1;
-    if (username) { fields.push(`name = $${idx++}`); values.push(username); }
-    if (phone) { fields.push(`phone = $${idx++}`); values.push(phone); }
-    if (fields.length === 0) {
-      return res.status(400).json({ error: 'No fields to update.' });
+
+    if (name !== undefined) {
+      fields.push(`name = $${idx++}`);
+      values.push(name);
     }
-    values.push(email);
-    const query = `UPDATE users SET ${fields.join(', ')} WHERE email = $${idx} RETURNING *`;
-    const result = await pool.query(query, values);
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'User not found' });
+    if (phone !== undefined) {
+      fields.push(`phone = $${idx++}`);
+      values.push(phone);
     }
-    res.json({ success: true, user: result.rows[0] });
+    if (roll_no !== undefined) {
+      fields.push(`roll_no = $${idx++}`);
+      values.push(roll_no);
+    }
+    if (room_no !== undefined) {
+      fields.push(`room_no = $${idx++}`);
+      values.push(room_no);
+    }
+    if (device_token !== undefined) {
+      fields.push(`device_token = $${idx++}`);
+      values.push(device_token);
+    }
+    if (is_active !== undefined) {
+      fields.push(`is_active = $${idx++}`);
+      values.push(Boolean(is_active));
+    }
+
+    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+
+    values.push(userId);
+    const result = await pool.query(
+      `UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+
+    if (result.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+    req.log?.info('user.update_details.success', { user_id: userId, updated: fields.length });
+    flowLog('UPDATE DETAILS', 'Updated', { email: req.user?.email, fields: fields.length });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_UPDATE_DETAILS',
+      entityType: 'user',
+      entityId: userId,
+      details: {
+        ...getReqMeta(req),
+        fields: {
+          name: name !== undefined,
+          phone: phone !== undefined,
+          roll_no: roll_no !== undefined,
+          room_no: room_no !== undefined,
+          device_token: device_token !== undefined,
+          is_active: is_active !== undefined,
+        },
+      },
+    });
+    return res.json({ success: true, user: result.rows[0] });
   } catch (err) {
     console.error('[UPDATE DETAILS] Error:', err.message);
-    res.status(500).json({ error: 'Failed to update user details', details: err.message });
+    req.log?.error('user.update_details.error', { user_id: userId, error: err?.message || String(err) });
+    flowLog('UPDATE DETAILS', 'Error', { email: req.user?.email, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_UPDATE_DETAILS_ERROR',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return res.status(500).json({ error: 'Failed to update user details', details: err.message });
   }
 });
 
-// Get user profile
-router.get('/:id', async (req, res) => {
-	const { id } = req.params;
-	try {
-		const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
-		if (result.rows.length === 0) {
-			return res.status(404).json({ error: 'User not found' });
-		}
-		res.json(result.rows[0]);
-	} catch (err) {
-		res.status(500).json({ error: 'Server error', details: err.message });
-	}
+// Save device token (legacy endpoint name used by existing clients).
+router.post('/saveDeviceToken', authenticateToken, async (req, res) => {
+  const userId = req.user?.id;
+  const deviceToken = req.body?.deviceToken;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+  if (!deviceToken) return res.status(400).json({ error: 'deviceToken is required' });
+
+  try {
+    flowLog('SAVE DEVICE TOKEN', 'Request received', { user_email: req.user?.email, deviceToken: mask(deviceToken) });
+    const result = await pool.query('UPDATE users SET device_token = $1 WHERE id = $2 RETURNING *', [deviceToken, userId]);
+    if (result.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+    flowLog('SAVE DEVICE TOKEN', 'Device token updated', { user_email: req.user?.email });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_SAVE_DEVICE_TOKEN',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req) },
+    });
+    return res.json({ success: true, message: 'Device token updated', user: result.rows[0] });
+  } catch (err) {
+    flowLog('SAVE DEVICE TOKEN', 'Error', { user_email: req.user?.email, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_SAVE_DEVICE_TOKEN_ERROR',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return res.status(500).json({ error: 'Server error', details: err.message });
+  }
 });
 
-// Create user
-router.post('/create-user', async (req, res) => {
-    const { username, email, phone, pg_id } = req.body;
-    const deviceToken = req.body.device_token ?? req.body.deviceToken;
-    if (!username || !email || !phone) {
-        return res.status(400).json({ error: 'username, email, and phone are required' });
-    }
-    try {
-        const existingUser = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-        if (existingUser.rows.length > 0) {
-            return res.status(409).json({ error: 'Email already exists' });
-        }
-
-        const existingPhone = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
-        if (existingPhone.rows.length > 0) {
-            return res.status(409).json({ error: 'Phone already exists' });
-        }
-
-        const fields = ['name', 'email', 'phone'];
-        const placeholders = ['$1', '$2', '$3'];
-        const values = [username, email, phone];
-
-        if (pg_id !== undefined) {
-            fields.push('pg_id');
-            placeholders.push(`$${fields.length}`);
-            values.push(pg_id);
-        }
-
-        if (deviceToken !== undefined) {
-            fields.push('device_token');
-            placeholders.push(`$${fields.length}`);
-            values.push(deviceToken);
-        }
-
-        const insertQuery = `INSERT INTO users (${fields.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING id, name, email, phone, pg_id, device_token`;
-        const result = await pool.query(insertQuery, values);
-        const user = result.rows[0];
-
-        return res.status(201).json({
-            id: user.id,
-            username: user.name,
-            email: user.email,
-            phone: user.phone,
-            pg_id: user.pg_id ?? null,
-            device_token: user.device_token ?? null
-        });
-    } catch (err) {
-        console.error('[CREATE USER] Error:', err.message);
-        return res.status(500).json({ error: 'Server error', details: err.message });
-    }
-});
-
-// Generate QR code for a user using email as unique identifier
-router.get('/:email/qrcode', async (req, res) => {
-    const { email } = req.params;
-    console.log(`[QR CODE] Request received for email: ${email}`);
-    try {
-        const QRCode = require("qrcode");
-        const qrData = JSON.stringify({ email });
-        const qrImage = await QRCode.toDataURL(qrData);
-        console.log(`[QR CODE] Successfully generated QR for email: ${email}`);
-        res.json({ qr: qrImage });
-    } catch (err) {
-        console.error(`[QR CODE] Failed to generate QR for email: ${email}. Error: ${err.message}`);
-        res.status(500).json({ error: 'Failed to generate QR', details: err.message });
-    }
-});
-
-// Delete user (admin only)
-router.delete('/:id', async (req, res) => {
-	const { id } = req.params;
-	try {
-		await pool.query('DELETE FROM users WHERE id = $1', [id]);
-		res.json({ message: 'User deleted' });
-	} catch (err) {
-		res.status(500).json({ error: 'Server error', details: err.message });
-	}
-});
-
-// User requests to enroll in a PG
-const { notifyAdmin } = require('../services/notificationService');
+// Enroll student into a hostel (immediate assignment).
 router.post('/enroll', authenticateToken, async (req, res) => {
-    console.log('[ENROLL] Request body:', req.body);
-    console.log('[ENROLL] User:', req.user);
-    const { email } = req.user; // Using email as userId
-    const { pg_id } = req.body;
-    if (!pg_id) {
-        return res.status(400).json({ error: 'PG ID is required' });
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const hostelId = req.body?.hostel_id;
+  if (!hostelId) return res.status(400).json({ error: 'Hostel ID is required' });
+
+  const today = getISTDateString();
+
+  try {
+    flowLog('ENROLL', 'Request received', { email: req.user?.email, hostel_id: hostelId });
+    req.log?.info('user.enroll.start', { user_id: userId, hostel_id: hostelId });
+    const existing = await getActiveHostelAssignment({ userId, date: today });
+    if (existing && String(existing) === String(hostelId)) {
+      req.log?.info('user.enroll.noop', { user_id: userId, hostel_id: existing });
+      flowLog('ENROLL', 'Already enrolled', { email: req.user?.email, hostel_id: existing });
+      await writeAuditLog({
+        collegeId: req.user?.college_id ?? null,
+        actorUserId: userId,
+        action: 'USER_ENROLL_NOOP',
+        entityType: 'user',
+        entityId: userId,
+        details: { ...getReqMeta(req), hostel_id: existing },
+      });
+      return res.json({ success: true, message: 'Already enrolled in this hostel', hostel_id: existing });
     }
-    try {
-        // Check if user exists
-        const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-        if (userResult.rows.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
-        }
 
-        // Use numeric userId for user_id
-        const userId = userResult.rows[0].id;
-        await pool.query(
-            'INSERT INTO enrollments (user_id, user_email, pg_id, status) VALUES ($1, $2, $3, 1) ON CONFLICT (user_email, pg_id) DO UPDATE SET status = 1',
-            [userId, email, pg_id]
-        );
-
-        // Notify the admin of this PG using notificationService
-        try {
-            const adminResult = await pool.query('SELECT * FROM admins WHERE pg_id = $1 LIMIT 1', [pg_id]);
-            if (adminResult.rows.length > 0) {
-                const admin = adminResult.rows[0];
-                const title = 'New Enrollment Request';
-                const message = `${userResult.rows[0].username || userResult.rows[0].name || email} requested to join your PG.`;
-                await notifyAdmin({ adminId: admin.id, title, message, type: 'enrollment' });
-            } else {
-                console.warn(`[ENROLL] No admin found for PG ${pg_id}, notification not sent.`);
-            }
-        } catch (notifyErr) {
-            console.error(`[ENROLL] Error notifying admin for PG ${pg_id}:`, notifyErr.message);
-        }
-
-        res.json({ message: 'Enrollment request submitted. Pending approval.' });
-    } catch (err) {
-        console.error('[ENROLL] Error:', err.message);
-        res.status(500).json({ error: 'Server error', details: err.message });
+    if (existing) {
+      await pool.query(
+        `UPDATE user_hostel_assignments
+         SET end_date = ($2::date - INTERVAL '1 day')::date
+         WHERE user_id = $1 AND hostel_id = $3 AND end_date IS NULL`,
+        [userId, today, existing]
+      );
     }
+
+    await pool.query(
+      `INSERT INTO user_hostel_assignments (user_id, hostel_id, start_date, end_date, reason)
+       VALUES ($1, $2, $3, NULL, $4)`,
+      [userId, hostelId, today, 'app-enroll']
+    );
+
+    req.log?.info('user.enroll.success', { user_id: userId, hostel_id: hostelId, previous_hostel_id: existing ?? null });
+    flowLog('ENROLL', 'Enrolled', { email: req.user?.email, hostel_id: hostelId });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_ENROLL',
+      entityType: 'user_hostel_assignment',
+      entityId: `${userId}:${hostelId}:${today}`,
+      details: { ...getReqMeta(req), hostel_id: hostelId, previous_hostel_id: existing ?? null },
+    });
+    return res.json({ success: true, message: 'Hostel enrollment saved', hostel_id: hostelId });
+  } catch (err) {
+    console.error('[ENROLL] Error:', err.message);
+    req.log?.error('user.enroll.error', { user_id: userId, hostel_id: hostelId, error: err?.message || String(err) });
+    flowLog('ENROLL', 'Error', { email: req.user?.email, hostel_id: hostelId, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_ENROLL_ERROR',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), error: err?.message || String(err), hostel_id: hostelId },
+    });
+    return res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// Student QR generation (QR contains student identity).
+router.get('/qrcode', authenticateToken, async (req, res) => {
+  const userId = req.user?.id;
+  const email = req.user?.email;
+  if (!userId || !email) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    flowLog('QRCODE', 'Request received', { email });
+    const today = getISTDateString();
+    const hostelId = await getActiveHostelAssignment({ userId, date: today });
+    const QRCode = require('qrcode');
+    const payload = { user_id: userId, email, hostel_id: hostelId };
+    const qr = await QRCode.toDataURL(JSON.stringify(payload));
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_QR_GENERATED',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), hostel_id: hostelId ?? null },
+    });
+    flowLog('QRCODE', 'Generated', { email, hostel_id: hostelId ?? '' });
+    return res.json({ qr, payload });
+  } catch (err) {
+    flowLog('QRCODE', 'Error', { email, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_QR_GENERATED_ERROR',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return res.status(500).json({ error: 'Failed to generate QR', details: err.message });
+  }
+});
+
+// Home/planner: weekly menu for the student's hostel (read-only).
+router.get('/assigned-meals', authenticateToken, async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    flowLog('ASSIGNED MEALS', 'Request received', { email: req.user?.email });
+    const today = getISTDateString();
+    const hostelId = await getActiveHostelAssignment({ userId, date: today });
+    if (!hostelId) return res.status(403).json({ error: 'User not enrolled in any hostel' });
+
+    const daysRes = await pool.query(
+      `SELECT d::date AS date, EXTRACT(DOW FROM d)::int AS dow
+       FROM generate_series($1::date, ($1::date + INTERVAL '6 day')::date, INTERVAL '1 day') d`,
+      [today]
+    );
+
+    const templateRes = await pool.query(
+      `SELECT day_of_week, meal, status, note, items
+       FROM hostel_weekly_menus
+       WHERE hostel_id = $1`,
+      [hostelId]
+    );
+    const templates = new Map(templateRes.rows.map(r => [`${r.day_of_week}:${r.meal}`, r]));
+
+    const overrideRes = await pool.query(
+      `SELECT date, meal, status, note, items
+       FROM meal_calendars
+       WHERE hostel_id = $1
+         AND date >= $2::date
+         AND date <= ($2::date + INTERVAL '6 day')::date`,
+      [hostelId, today]
+    );
+    const overrides = new Map(overrideRes.rows.map(r => [`${r.date}:${r.meal}`, r]));
+
+    const meals = [];
+    for (const day of daysRes.rows) {
+      const date = day.date; // returned as YYYY-MM-DD by pg for date
+      const dow = day.dow;
+      for (const meal of MEAL_TYPES) {
+        const override = overrides.get(`${date}:${meal}`);
+        if (override) {
+          meals.push({ date, meal, status: override.status, note: override.note, items: override.items });
+          continue;
+        }
+        const template = templates.get(`${dow}:${meal}`);
+        if (template) {
+          meals.push({ date, meal, status: template.status, note: template.note, items: template.items });
+          continue;
+        }
+        meals.push({ date, meal, status: 'open', note: null, items: [] });
+      }
+    }
+    meals.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : MEAL_TYPES.indexOf(a.meal) - MEAL_TYPES.indexOf(b.meal)));
+
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_ASSIGNED_MEALS',
+      entityType: 'hostel',
+      entityId: hostelId,
+      details: { ...getReqMeta(req), from: today, returned: meals.length, overrides: overrideRes.rows.length },
+    });
+    flowLog('ASSIGNED MEALS', 'Returned', { hostel_id: hostelId, days: 7, overrides: overrideRes.rows.length });
+    return res.json({ hostel_id: hostelId, from: today, to: null, meals });
+  } catch (err) {
+    console.error('[ASSIGNED MEALS] Error:', err.message);
+    flowLog('ASSIGNED MEALS', 'Error', { email: req.user?.email, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_ASSIGNED_MEALS_ERROR',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// Student stats: attended/missed per meal type (aggregated counts).
+router.get('/stats', authenticateToken, async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const from = req.query.from;
+  const to = req.query.to;
+  if (!from || !to) return res.status(400).json({ error: 'from and to are required (YYYY-MM-DD)' });
+
+  try {
+    flowLog('STATS', 'Request received', { email: req.user?.email, from, to });
+    const hostelId = await getActiveHostelAssignment({ userId, date: to });
+    if (!hostelId) return res.status(403).json({ error: 'User not enrolled in any hostel' });
+
+    const attendedRes = await pool.query(
+      `SELECT meal, COUNT(*)::int AS attended
+       FROM attendance_scans
+       WHERE user_id = $1 AND hostel_id = $2 AND date >= $3 AND date <= $4
+       GROUP BY meal`,
+      [userId, hostelId, from, to]
+    );
+
+    const possibleRes = await pool.query(
+      `SELECT meal, COUNT(*)::int AS possible
+       FROM meal_calendars
+       WHERE hostel_id = $1 AND date >= $2 AND date <= $3 AND status <> 'holiday'
+       GROUP BY meal`,
+      [hostelId, from, to]
+    );
+
+    const attended = Object.fromEntries(MEAL_TYPES.map(m => [m, 0]));
+    const possible = Object.fromEntries(MEAL_TYPES.map(m => [m, 0]));
+
+    for (const row of attendedRes.rows) if (attended[row.meal] !== undefined) attended[row.meal] = row.attended;
+    for (const row of possibleRes.rows) if (possible[row.meal] !== undefined) possible[row.meal] = row.possible;
+
+    const missed = Object.fromEntries(MEAL_TYPES.map(m => [m, Math.max(0, (possible[m] || 0) - (attended[m] || 0))]));
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_STATS',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), from, to, hostel_id: hostelId },
+    });
+    flowLog('STATS', 'Returned', { email: req.user?.email, hostel_id: hostelId });
+    return res.json({ from, to, hostel_id: hostelId, attended, missed });
+  } catch (err) {
+    console.error('[STATS] Error:', err.message);
+    flowLog('STATS', 'Error', { email: req.user?.email, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_STATS_ERROR',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), error: err?.message || String(err), from, to },
+    });
+    return res.status(500).json({ error: 'Server error', details: err.message });
+  }
+});
+
+// Check whether the student is assigned to a hostel.
+router.get('/check-status', authenticateToken, async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    flowLog('CHECK STATUS', 'Request received', { email: req.user?.email });
+    const today = getISTDateString();
+    const hostelId = await getActiveHostelAssignment({ userId, date: today });
+    if (!hostelId) return res.json({ status: 0 });
+
+    const hostelRes = await pool.query(
+      'SELECT id, hostel_code, name, address, college_id FROM hostels WHERE id = $1',
+      [hostelId]
+    );
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_CHECK_STATUS',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), hostel_id: hostelId },
+    });
+    flowLog('CHECK STATUS', 'User assigned to hostel', { email: req.user?.email, hostel_id: hostelId });
+    return res.json({ status: 2, hostel: hostelRes.rows?.[0] ?? { id: hostelId } });
+  } catch (err) {
+    flowLog('CHECK STATUS', 'Error', { email: req.user?.email, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_CHECK_STATUS_ERROR',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 module.exports = router;

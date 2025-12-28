@@ -1,6 +1,6 @@
-# Meal Manager Backend
+# Count Wise Backend (Mobile App)
 
-This is a Node.js backend for the Meal Manager app using Express.js.
+Node.js (Express) + PostgreSQL backend for the **Count Wise** Expo app (student + mess manager).
 
 ## Getting Started
 
@@ -8,11 +8,15 @@ This is a Node.js backend for the Meal Manager app using Express.js.
    ```bash
    npm install
    ```
-2. Start the server:
+2. Apply DB migrations (Postgres):
+   ```bash
+   psql "$DATABASE_URL" -f migrations/20251226_app_only_schema_updates.sql
+   ```
+3. Start the server:
    ```bash
    npm start
    ```
-3. For development with auto-reload:
+4. For development with auto-reload:
    ```bash
    npm run dev
    ```
@@ -31,12 +35,18 @@ If your mobile app runs in Expo Go on a real device, it cannot reach your backen
 
 ## API Endpoints
 
-- `GET /` - Health check
-- `GET /meals` - Returns a list of meals (currently empty)
+- See `docs/API.md`
+
+## What This Backend Supports (for now)
+- Student OTP login + profile
+- Hostel enrollment request + manager approval
+- Weekly menu set by mess manager (`breakfast|lunch|snacks|dinner` + `holiday`)
+- QR scan attendance + manager stats
 
 ## Project Structure
 - `index.js` - Main server file
-- `package.json` - Project metadata and dependencies
+- `routes/` - Express route handlers
+- `migrations/` - SQL migrations (manual apply)
 
 ## License
 ISC

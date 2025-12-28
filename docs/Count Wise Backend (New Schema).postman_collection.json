@@ -1,0 +1,564 @@
+{
+	"info": {
+		"_postman_id": "4fe1500f-69db-4d02-9a9a-4ebc4d73ab76",
+		"name": "Count Wise Backend (New Schema)",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "48406425",
+		"_collection_link": "https://akshitagarwal431-3660681.postman.co/workspace/akshit-agarwal's-Workspace~c8146ad5-1fca-4dcf-8e37-2667e50075df/collection/48406425-4fe1500f-69db-4d02-9a9a-4ebc4d73ab76?action=share&source=collection_link&creator=48406425"
+	},
+	"item": [
+		{
+			"name": "Health",
+			"item": [
+				{
+					"name": "GET /ping",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/ping",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"ping"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Auth (OTP)",
+			"item": [
+				{
+					"name": "POST /auth/send-otp (Student)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"{{studentEmail}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/auth/send-otp",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"send-otp"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "POST /auth/verify-otp (Student)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"{{studentEmail}}\",\n  \"otp\": \"{{otp}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/auth/verify-otp",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"verify-otp"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "POST /auth/save-details (Student profile + optional hostel assignment)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"try {",
+									"  const json = pm.response.json();",
+									"  if (json && json.token) pm.collectionVariables.set('studentToken', json.token);",
+									"} catch (e) {}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"Student Name\",\n  \"email\": \"{{studentEmail}}\",\n  \"phone\": \"9999999999\",\n  \"roll_no\": \"R123\",\n  \"room_no\": \"A-101\",\n  \"college_id\": {{collegeId}},\n  \"hostel_id\": {{hostelId}}\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/auth/save-details",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"save-details"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "POST /auth/send-otp (Manager)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"{{managerEmail}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/auth/send-otp",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"send-otp"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Student (Auth)",
+			"item": [
+				{
+					"name": "GET /user/qrcode",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{studentToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/user/qrcode",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"user",
+								"qrcode"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "GET /user/assigned-meals",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{studentToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/user/assigned-meals",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"user",
+								"assigned-meals"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "GET /user/stats",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{studentToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/user/stats?from={{from}}&to={{to}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"user",
+								"stats"
+							],
+							"query": [
+								{
+									"key": "from",
+									"value": "{{from}}"
+								},
+								{
+									"key": "to",
+									"value": "{{to}}"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "GET /user/check-status",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{studentToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/user/check-status",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"user",
+								"check-status"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Meals (Auth)",
+			"item": [
+				{
+					"name": "GET /meals/menu",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{studentToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/meals/menu?hostel_id={{hostelId}}&date={{date}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"meals",
+								"menu"
+							],
+							"query": [
+								{
+									"key": "hostel_id",
+									"value": "{{hostelId}}"
+								},
+								{
+									"key": "date",
+									"value": "{{date}}"
+								}
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Manager (Auth)",
+			"item": [
+				{
+					"name": "POST /meals/menu (Upsert meal calendar)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{managerToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"hostel_id\": {{hostelId}},\n  \"date\": \"{{date}}\",\n  \"meal_type\": \"snacks\",\n  \"status\": \"open\",\n  \"note\": \"Tea at 5\",\n  \"items\": [\"Tea\", \"Biscuits\"]\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/meals/menu",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"meals",
+								"menu"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "DELETE /meals/menu/item",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{managerToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"hostel_id\": {{hostelId}},\n  \"date\": \"{{date}}\",\n  \"meal_type\": \"snacks\",\n  \"item\": \"Tea\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/meals/menu/item",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"meals",
+								"menu",
+								"item"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "POST /admin/mark-attendance",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{managerToken}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"{{studentEmail}}\",\n  \"meal_type\": \"snacks\",\n  \"source\": \"qr\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/admin/mark-attendance",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"admin",
+								"mark-attendance"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "GET /admin/qr-scans/today",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{managerToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/admin/qr-scans/today",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"admin",
+								"qr-scans",
+								"today"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "GET /admin/qr-scans/summary",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{managerToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/admin/qr-scans/summary?from={{from}}&to={{to}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"admin",
+								"qr-scans",
+								"summary"
+							],
+							"query": [
+								{
+									"key": "from",
+									"value": "{{from}}"
+								},
+								{
+									"key": "to",
+									"value": "{{to}}"
+								}
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "GET /admin/qr-scans/details",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{managerToken}}"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/admin/qr-scans/details?date={{date}}&meal_type=snacks",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"admin",
+								"qr-scans",
+								"details"
+							],
+							"query": [
+								{
+									"key": "date",
+									"value": "{{date}}"
+								},
+								{
+									"key": "meal_type",
+									"value": "snacks"
+								}
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:3000"
+		},
+		{
+			"key": "studentToken",
+			"value": ""
+		},
+		{
+			"key": "managerToken",
+			"value": ""
+		},
+		{
+			"key": "hostelId",
+			"value": "1"
+		},
+		{
+			"key": "collegeId",
+			"value": "1"
+		},
+		{
+			"key": "date",
+			"value": "2025-01-01"
+		},
+		{
+			"key": "from",
+			"value": "2025-01-01"
+		},
+		{
+			"key": "to",
+			"value": "2025-01-07"
+		},
+		{
+			"key": "studentEmail",
+			"value": "student@example.com"
+		},
+		{
+			"key": "managerEmail",
+			"value": "manager@example.com"
+		},
+		{
+			"key": "otp",
+			"value": "123456"
+		}
+	]
+}

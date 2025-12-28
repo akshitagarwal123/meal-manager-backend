@@ -1,149 +1,325 @@
 const express = require('express');
-const router = express.Router();
 const pool = require('../config/db');
 const authenticateToken = require('../middleware/authenticateToken');
 const { getISTDateString } = require('../utils/date');
-const { broadcastToPG } = require('../services/notificationService');
+const { writeAuditLog, getReqMeta } = require('../utils/audit');
+const { flowLog, mask } = require('../utils/flowLog');
 
-// Get meal menu for a PG and date
+const router = express.Router();
+
+const MEAL_TYPES = ['breakfast', 'lunch', 'snacks', 'dinner'];
+
+function normalizeMeal(value) {
+  const normalized = String(value || '').toLowerCase();
+  return MEAL_TYPES.includes(normalized) ? normalized : null;
+}
+
+async function getManagerHostelId({ userId, date }) {
+  const result = await pool.query(
+    `SELECT hostel_id
+     FROM hostel_staff
+     WHERE user_id = $1
+       AND start_date <= $2
+       AND (end_date IS NULL OR end_date >= $2)
+     ORDER BY start_date DESC
+     LIMIT 1`,
+    [userId, date]
+  );
+  return result.rows?.[0]?.hostel_id ?? null;
+}
+
+function parseDayOfWeek(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const i = Math.floor(n);
+  if (i < 0 || i > 6) return null;
+  return i;
+}
+
+async function requireManagerForHostel({ req, hostelId }) {
+  const userId = req.user?.id;
+  if (!userId) return { ok: false, status: 401, error: 'Unauthorized' };
+  if (req.user?.role !== 'manager') return { ok: false, status: 403, error: 'Forbidden' };
+
+  const today = getISTDateString();
+  const assignedHostel = await getManagerHostelId({ userId, date: today });
+  if (!assignedHostel || String(assignedHostel) !== String(hostelId)) {
+    return { ok: false, status: 403, error: 'Manager not assigned to this hostel' };
+  }
+  return { ok: true, userId, assignedHostel };
+}
+
+async function upsertDateOverride(req, res) {
+  const hostelId = req.body?.hostel_id;
+  const date = req.body?.date;
+  const meal = normalizeMeal(req.body?.meal_type ?? req.body?.meal);
+  const status = String(req.body?.status || 'open').toLowerCase();
+  const note = req.body?.note ? String(req.body.note) : null;
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  if (!hostelId || !date || !meal) return res.status(400).json({ error: 'hostel_id, date, and meal_type are required' });
+  if (!['open', 'holiday'].includes(status)) return res.status(400).json({ error: 'status must be open or holiday' });
+
+  try {
+    flowLog('MEALS OVERRIDE', 'Request received', { hostel_id: hostelId, date, meal_type: meal });
+    const gate = await requireManagerForHostel({ req, hostelId });
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+    const result = await pool.query(
+      `INSERT INTO meal_calendars (hostel_id, date, meal, status, note, items)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (hostel_id, date, meal)
+       DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note, items = EXCLUDED.items, updated_at = now()
+       RETURNING *`,
+      [hostelId, date, meal, status, note, JSON.stringify(items)]
+    );
+
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: gate.userId,
+      action: 'MEALS_DATE_OVERRIDE_UPSERT',
+      entityType: 'meal_calendar',
+      entityId: `${hostelId}:${date}:${meal}`,
+      details: { ...getReqMeta(req), status, items_count: items.length, note: note ? true : false },
+    });
+
+    flowLog('MEALS OVERRIDE', 'Saved', { hostel_id: hostelId, date, meal_type: meal, status, items_count: items.length });
+    return res.json({ success: true, override: result.rows[0] });
+  } catch (err) {
+    console.error('[UPSERT DATE OVERRIDE] Error:', err.message);
+    flowLog('MEALS OVERRIDE', 'Error', { hostel_id: hostelId, date, meal_type: meal, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: req.user?.id ?? null,
+      action: 'MEALS_DATE_OVERRIDE_UPSERT_ERROR',
+      entityType: 'meal_calendar',
+      entityId: `${hostelId}:${date}:${meal}`,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return res.status(500).json({ error: 'Failed to save override', details: err.message });
+  }
+}
+
+// Admin/manager-only: upsert weekly menu template row (hostel + day_of_week + meal).
+// POST /meals/template
+router.post('/template', authenticateToken, async (req, res) => {
+  const hostelId = req.body?.hostel_id;
+  const dayOfWeek = parseDayOfWeek(req.body?.day_of_week);
+  const meal = normalizeMeal(req.body?.meal_type ?? req.body?.meal);
+  const status = String(req.body?.status || 'open').toLowerCase();
+  const note = req.body?.note ? String(req.body.note) : null;
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  if (!hostelId || dayOfWeek === null || !meal) {
+    return res.status(400).json({ error: 'hostel_id, day_of_week (0-6), and meal_type are required' });
+  }
+  if (!['open', 'holiday'].includes(status)) return res.status(400).json({ error: 'status must be open or holiday' });
+
+  try {
+    flowLog('MEALS TEMPLATE', 'Upsert request received', { hostel_id: hostelId, day_of_week: dayOfWeek, meal_type: meal });
+    const gate = await requireManagerForHostel({ req, hostelId });
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+    const result = await pool.query(
+      `INSERT INTO hostel_weekly_menus (hostel_id, day_of_week, meal, status, note, items)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (hostel_id, day_of_week, meal)
+       DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note, items = EXCLUDED.items, updated_at = now()
+       RETURNING hostel_id, day_of_week, meal, status, note, items, updated_at`,
+      [hostelId, dayOfWeek, meal, status, note, JSON.stringify(items)]
+    );
+
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: gate.userId,
+      action: 'MEALS_TEMPLATE_UPSERT',
+      entityType: 'hostel_weekly_menu',
+      entityId: `${hostelId}:${dayOfWeek}:${meal}`,
+      details: { ...getReqMeta(req), status, items_count: items.length, note: note ? true : false },
+    });
+
+    flowLog('MEALS TEMPLATE', 'Saved', { hostel_id: hostelId, day_of_week: dayOfWeek, meal_type: meal, status, items_count: items.length });
+    return res.json({ success: true, template: result.rows[0] });
+  } catch (err) {
+    console.error('[UPSERT TEMPLATE] Error:', err.message);
+    flowLog('MEALS TEMPLATE', 'Error', { hostel_id: hostelId, day_of_week: dayOfWeek, meal_type: meal, error: err?.message || String(err) });
+    return res.status(500).json({ error: 'Failed to save weekly template', details: err.message });
+  }
+});
+
+// Admin/manager-only: get weekly template for a hostel (optionally a specific day_of_week).
+// GET /meals/template?hostel_id=1&day_of_week=0
+router.get('/template', authenticateToken, async (req, res) => {
+  const hostelId = req.query.hostel_id;
+  const dayOfWeek = req.query.day_of_week !== undefined ? parseDayOfWeek(req.query.day_of_week) : null;
+  if (!hostelId) return res.status(400).json({ error: 'hostel_id is required' });
+  if (req.query.day_of_week !== undefined && dayOfWeek === null) return res.status(400).json({ error: 'day_of_week must be 0-6' });
+
+  try {
+    flowLog('MEALS TEMPLATE', 'Fetch request received', { hostel_id: hostelId, day_of_week: dayOfWeek ?? 'all' });
+    const gate = await requireManagerForHostel({ req, hostelId });
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+    const params = [hostelId];
+    let where = 'WHERE hostel_id = $1';
+    if (dayOfWeek !== null) {
+      params.push(dayOfWeek);
+      where += ` AND day_of_week = $${params.length}`;
+    }
+
+    const result = await pool.query(
+      `SELECT hostel_id, day_of_week, meal, status, note, items, updated_at
+       FROM hostel_weekly_menus
+       ${where}
+       ORDER BY day_of_week ASC, meal ASC`,
+      params
+    );
+
+    flowLog('MEALS TEMPLATE', 'Fetched', { hostel_id: hostelId, count: result.rows.length });
+    return res.json({ success: true, hostel_id: hostelId, templates: result.rows });
+  } catch (err) {
+    console.error('[GET TEMPLATE] Error:', err.message);
+    flowLog('MEALS TEMPLATE', 'Error', { hostel_id: hostelId, error: err?.message || String(err) });
+    return res.status(500).json({ error: 'Failed to fetch weekly template', details: err.message });
+  }
+});
+
+// Read-only menu for a hostel + date
+// GET /meals/menu?hostel_id&date=YYYY-MM-DD
 router.get('/menu', authenticateToken, async (req, res) => {
-    const { pg_id, date } = req.query;
-    console.log(`[GET MEAL MENU] Request received: pg_id=${pg_id}, date=${date}`);
-    if (!pg_id || !date) {
-        console.warn('[GET MEAL MENU] Missing pg_id or date in query params');
-        return res.status(400).json({ error: 'pg_id and date are required as query params' });
-    }
-    try {
-        const user_email = req.user.email;
-        console.log('[GET MEAL MENU] Querying meal_menus table');
-        const result = await pool.query(
-            `SELECT meal_type, items, date,
-                    COALESCE(status, 'open') AS status,
-                    note
-             FROM meal_menus
-             WHERE pg_id = $1 AND date = $2`,
-            [pg_id, date]
-        );
-        console.log('[GET MEAL MENU] Meals found:', result.rows.length);
-        // For each meal, fetch the user's enrollment status
-        const mealsWithStatus = await Promise.all(result.rows.map(async meal => {
-            const enrollResult = await pool.query(
-                'SELECT enrolled FROM user_meal_enrollments WHERE email = $1 AND pg_id = $2 AND meal_type = $3 AND date = $4',
-                [user_email, pg_id, meal.meal_type, date]
-            );
-            return {
-                ...meal,
-                enrolled: enrollResult.rows.length > 0 ? enrollResult.rows[0].enrolled : undefined
-            };
-        }));
-        const response = { meals: mealsWithStatus };
-        console.log('[GET MEAL MENU] Response:', JSON.stringify(response));
-        res.json(response);
-    } catch (err) {
-        console.error('[GET MEAL MENU] Error:', err.message);
-        res.status(500).json({ error: 'Failed to fetch meal menu', details: err.message });
-    }
+  const hostelId = req.query.hostel_id;
+  const date = req.query.date;
+  if (!hostelId || !date) return res.status(400).json({ error: 'hostel_id and date are required as query params' });
+
+  try {
+    flowLog('MEALS MENU', 'Fetch request received', { hostel_id: hostelId, date });
+    const overrideRes = await pool.query(
+      `SELECT hostel_id, date, meal, status, note, items
+       FROM meal_calendars
+       WHERE hostel_id = $1 AND date = $2
+       ORDER BY meal ASC`,
+      [hostelId, date]
+    );
+    const overrides = new Map(overrideRes.rows.map(r => [r.meal, r]));
+
+    const templateRes = await pool.query(
+      `SELECT meal, status, note, items
+       FROM hostel_weekly_menus
+       WHERE hostel_id = $1
+         AND day_of_week = EXTRACT(DOW FROM $2::date)::int
+       ORDER BY meal ASC`,
+      [hostelId, date]
+    );
+    const templates = new Map(templateRes.rows.map(r => [r.meal, r]));
+
+    const merged = MEAL_TYPES.map(meal => {
+      const override = overrides.get(meal);
+      if (override) return override;
+      const template = templates.get(meal);
+      if (template) {
+        return {
+          hostel_id: Number(hostelId),
+          date,
+          meal,
+          status: template.status,
+          note: template.note,
+          items: template.items,
+        };
+      }
+      return { hostel_id: Number(hostelId), date, meal, status: 'open', note: null, items: [] };
+    });
+
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: req.user?.id ?? null,
+      action: 'MEALS_MENU_GET',
+      entityType: 'meal_calendar',
+      entityId: `${hostelId}:${date}`,
+      details: { ...getReqMeta(req), overrides: overrideRes.rows.length, returned: merged.length },
+    });
+    flowLog('MEALS MENU', 'Fetched', { hostel_id: hostelId, date, overrides: overrideRes.rows.length });
+    return res.json({ hostel_id: hostelId, date, meals: merged });
+  } catch (err) {
+    console.error('[GET MENU] Error:', err.message);
+    flowLog('MEALS MENU', 'Error', { hostel_id: hostelId, date, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: req.user?.id ?? null,
+      action: 'MEALS_MENU_GET_ERROR',
+      entityType: 'meal_calendar',
+      entityId: `${hostelId}:${date}`,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return res.status(500).json({ error: 'Failed to fetch menu', details: err.message });
+  }
 });
 
-// Save or update meal menu for a PG, date, and meal_type
-router.post('/menu', authenticateToken, async (req, res) => {
-    const { pg_id, date, meal_type } = req.body;
-    const status = String(req.body?.status || 'open').toLowerCase();
-    const note = req.body?.note ? String(req.body.note) : null;
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    console.log(`[SAVE MEAL MENU] Request received: pg_id=${pg_id}, date=${date}, meal_type=${meal_type}, status=${status}, items=${JSON.stringify(items)}`);
-    if (!pg_id || !date || !meal_type) {
-        console.warn('[SAVE MEAL MENU] Missing required fields in request body');
-        return res.status(400).json({ error: 'pg_id, date, and meal_type are required' });
-    }
-    if (!['open', 'holiday'].includes(status)) {
-        return res.status(400).json({ error: 'status must be open or holiday' });
-    }
-    try {
-        console.log('[SAVE MEAL MENU] Upserting meal menu');
-        const upsert = await pool.query(
-            `INSERT INTO meal_menus (pg_id, date, meal_type, items, status, note) VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (pg_id, date, meal_type)
-             DO UPDATE SET items = $4, status = $5, note = $6, updated_at = NOW()
-             RETURNING *`,
-            [pg_id, date, meal_type, JSON.stringify(items), status, note]
-        );
-        console.log('[SAVE MEAL MENU] Upserted meal:', upsert.rows[0]);
+// Date-specific override (exceptions) for a hostel/date/meal (manager only).
+// POST /meals/override  (preferred)
+router.post('/override', authenticateToken, upsertDateOverride);
 
-        // Enroll all users in the PG for this meal/date by default (enrolled=true) if not already present
-        try {
-            const usersResult = await pool.query(
-                `SELECT u.id, u.email, u.name, u.device_token FROM users u
-                 INNER JOIN enrollments e ON e.user_id = u.id
-                 WHERE e.pg_id = $1`,
-                [pg_id]
-            );
-            if (usersResult.rows.length > 0) {
-                for (const user of usersResult.rows) {
-                    // Insert only if not already present
-                    await pool.query(
-                        `INSERT INTO user_meal_enrollments (user_id, pg_id, email, date, meal_type, enrolled, created_at)
-                         VALUES ($1, $2, $3, $4, $5, true, NOW())
-                         ON CONFLICT (user_id, pg_id, date, meal_type) DO NOTHING`,
-                        [user.id, pg_id, user.email, date, meal_type]
-                    );
-                }
-                // Send meal menu notification using notificationService
-                const title = status === 'holiday' ? `Holiday: ${meal_type}` : `Meal Menu Updated: ${meal_type}`;
-                const body =
-                    status === 'holiday'
-                        ? `No service for ${meal_type}${note ? ` (${note})` : ''}.`
-                        : `Today's menu: ${items.join(', ')}`;
-                await broadcastToPG({ pgId: pg_id, title, message: body, type: 'meal-menu' });
-                console.log(`[MEAL MENU NOTIFICATION] Notification sent to all PG members for ${meal_type} on ${date}`);
-            } else {
-                console.log('[MEAL MENU NOTIFICATION] No PG members found.');
-            }
-        } catch (notifyErr) {
-            console.error('[MEAL MENU NOTIFICATION] Error:', notifyErr.message);
-        }
+// Backward-compatible alias (older clients).
+// POST /meals/menu
+router.post('/menu', authenticateToken, upsertDateOverride);
 
-        res.json({ success: true, meal: upsert.rows[0] });
-    } catch (err) {
-        console.error('[SAVE MEAL MENU] Error:', err.message);
-        res.status(500).json({ error: 'Failed to save meal menu', details: err.message });
-    }
-});
-
-// Remove an item from a meal menu
+// Remove an item from a meal's items list (manager only)
 router.delete('/menu/item', authenticateToken, async (req, res) => {
-    const { pg_id, date, meal_type, item } = req.body;
-    console.log(`[DELETE MEAL ITEM] Request received: pg_id=${pg_id}, date=${date}, meal_type=${meal_type}, item=${item}`);
-    if (!pg_id || !date || !meal_type || !item) {
-        console.warn('[DELETE MEAL ITEM] Missing required fields in request body');
-        return res.status(400).json({ error: 'pg_id, date, meal_type, and item are required' });
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const hostelId = req.body?.hostel_id;
+  const date = req.body?.date;
+  const meal = normalizeMeal(req.body?.meal_type ?? req.body?.meal);
+  const item = req.body?.item;
+  if (!hostelId || !date || !meal || !item) {
+    return res.status(400).json({ error: 'hostel_id, date, meal_type, and item are required' });
+  }
+
+  try {
+    flowLog('MEALS MENU', 'Delete item request received', { hostel_id: hostelId, date, meal_type: meal, item: mask(item) });
+    const today = getISTDateString();
+    const assignedHostel = await getManagerHostelId({ userId, date: today });
+    if (!assignedHostel || String(assignedHostel) !== String(hostelId)) {
+      return res.status(403).json({ error: 'Manager not assigned to this hostel' });
     }
-    try {
-        // Fetch current items
-        console.log('[DELETE MEAL ITEM] Fetching current items');
-        const result = await pool.query(
-            'SELECT items FROM meal_menus WHERE pg_id = $1 AND date = $2 AND meal_type = $3',
-            [pg_id, date, meal_type]
-        );
-        if (result.rows.length === 0) {
-            console.warn('[DELETE MEAL ITEM] Meal menu not found for pg_id:', pg_id, 'date:', date, 'meal_type:', meal_type);
-            return res.status(404).json({ error: 'Meal menu not found' });
-        }
-        let items = result.rows[0].items;
-        if (!Array.isArray(items)) items = [];
-        const newItems = items.filter(i => i !== item);
-        // Update items
-        console.log('[DELETE MEAL ITEM] Updating items after removal');
-        await pool.query(
-            'UPDATE meal_menus SET items = $1, updated_at = NOW() WHERE pg_id = $2 AND date = $3 AND meal_type = $4',
-            [JSON.stringify(newItems), pg_id, date, meal_type]
-        );
-        console.log('[DELETE MEAL ITEM] Updated items:', newItems);
-        res.json({ success: true, items: newItems });
-    } catch (err) {
-        console.error('[DELETE MEAL ITEM] Error:', err.message);
-        res.status(500).json({ error: 'Failed to delete meal item', details: err.message });
-    }
+
+    const existing = await pool.query(
+      'SELECT items FROM meal_calendars WHERE hostel_id = $1 AND date = $2 AND meal = $3',
+      [hostelId, date, meal]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Meal not found' });
+
+    const currentItems = Array.isArray(existing.rows[0].items) ? existing.rows[0].items : [];
+    const updatedItems = currentItems.filter(i => i !== item);
+
+    await pool.query(
+      'UPDATE meal_calendars SET items = $1, updated_at = now() WHERE hostel_id = $2 AND date = $3 AND meal = $4',
+      [JSON.stringify(updatedItems), hostelId, date, meal]
+    );
+
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'MEALS_MENU_DELETE_ITEM',
+      entityType: 'meal_calendar',
+      entityId: `${hostelId}:${date}:${meal}`,
+      details: { ...getReqMeta(req), item, items_count: updatedItems.length },
+    });
+    flowLog('MEALS MENU', 'Item deleted', { hostel_id: hostelId, date, meal_type: meal, items_count: updatedItems.length });
+    return res.json({ success: true, items: updatedItems });
+  } catch (err) {
+    console.error('[DELETE MENU ITEM] Error:', err.message);
+    flowLog('MEALS MENU', 'Delete item error', { hostel_id: hostelId, date, meal_type: meal, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'MEALS_MENU_DELETE_ITEM_ERROR',
+      entityType: 'meal_calendar',
+      entityId: `${hostelId}:${date}:${meal}`,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return res.status(500).json({ error: 'Failed to delete item', details: err.message });
+  }
 });
 
 module.exports = router;
