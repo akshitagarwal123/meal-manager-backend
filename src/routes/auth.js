@@ -1,7 +1,7 @@
 const jwt = require('jsonwebtoken');
 const express = require('express');
 const pool = require('../config/db');
-const transporter = require('../config/email');
+const mailer = require('../config/email');
 const { getISTDateString } = require('../utils/date');
 const { writeAuditLog, getReqMeta } = require('../utils/audit');
 const { flowLog, mask } = require('../utils/flowLog');
@@ -205,8 +205,8 @@ router.post('/send-otp', limitSendOtp, async (req, res) => {
     });
     req.log?.info('auth.send_otp.audit_saved', { email, actor_user_id: actorUserId, expires_at: expiresAt.toISOString() });
 
-    const mailPromise = transporter.sendMail({
-      from: process.env.EMAIL_USER,
+    const mailPromise = mailer.sendMail({
+      from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
       to: email,
       subject: 'Your OTP for Count Wise',
       text: `Your OTP is ${otp}. It is valid for 5 minutes.`,

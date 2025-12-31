@@ -12,8 +12,12 @@ This repo runs fine for local/dev demos, but production needs some configuration
 - `QR_TOKEN_SECRET` (separate from `JWT_SECRET` if possible)
 - `CORS_ORIGINS` (comma-separated, e.g. `https://app.example.com,https://admin.example.com`)
 - Email (OTP delivery):
-  - Gmail default (recommended for staging only): `EMAIL_USER`, `EMAIL_PASS` (app password; spaces OK)
-  - Custom SMTP (recommended for production): `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_SECURE`, `EMAIL_USER`, `EMAIL_PASS` (see `src/config/email.js`)
+  - Preferred (Render-safe): Brevo HTTP API (HTTPS)
+    - `BREVO_API_KEY`
+    - `EMAIL_FROM` (e.g. `CountWise <no-reply@yourdomain.com>`)
+  - SMTP fallback (may be blocked on some hosts like Render):
+    - Gmail default (recommended for local/staging): `EMAIL_USER`, `EMAIL_PASS` (app password; spaces OK)
+    - Custom SMTP: `EMAIL_HOST`, `EMAIL_PORT`, `EMAIL_SECURE`, `EMAIL_USER`, `EMAIL_PASS` (see `src/config/email.js`)
   - `OTP_EMAIL_TIMEOUT_MS=15000`
 
 ## Logging controls
