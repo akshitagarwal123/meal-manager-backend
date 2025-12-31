@@ -65,6 +65,7 @@ app.get('/healthz', async (req, res) => {
     await pool.query('SELECT 1');
     res.status(200).json({ ok: true });
   } catch (err) {
+    console.error('[HEALTHZ] DB unavailable:', err?.message || String(err));
     res.status(503).json({ ok: false, error: 'db_unavailable' });
   }
 });

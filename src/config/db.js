@@ -4,10 +4,19 @@ const { Pool, types } = require('pg');
 // Without this, some environments parse DATE into a JS Date at UTC midnight, which can show as the previous day in IST.
 types.setTypeParser(1082, value => value);
 
+function safeDbTarget(connectionString) {
+  try {
+    const u = new URL(connectionString);
+    return `${u.protocol}//${u.username ? '***' : ''}@${u.host}${u.pathname}`;
+  } catch {
+    return 'unparseable_DATABASE_URL';
+  }
+}
+
 // Use Render's DATABASE_URL if available, fallback to local config
 let pool;
 if (process.env.DATABASE_URL) {
-  console.log('Using DATABASE_URL for DB connection');
+  console.log(`Using DATABASE_URL for DB connection (${safeDbTarget(process.env.DATABASE_URL)})`);
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
