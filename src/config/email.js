@@ -34,7 +34,7 @@ async function sendViaBrevoApi({ from, to, subject, text }) {
     textContent: String(text || ''),
   };
 
-  const timeoutMs = Number(process.env.EMAIL_API_TIMEOUT_MS || 15000);
+  const timeoutMs = Number(process.env.EMAIL_API_TIMEOUT_MS || process.env.OTP_EMAIL_TIMEOUT_MS || 15000);
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {

@@ -205,6 +205,10 @@ router.post('/send-otp', limitSendOtp, async (req, res) => {
     });
     req.log?.info('auth.send_otp.audit_saved', { email, actor_user_id: actorUserId, expires_at: expiresAt.toISOString() });
 
+    const provider = process.env.BREVO_API_KEY ? 'brevo_api' : process.env.EMAIL_HOST ? 'smtp' : 'gmail';
+    flowLog('SEND OTP', 'Email provider selected', { provider });
+    req.log?.info('auth.send_otp.email_provider', { email, provider });
+
     const mailPromise = mailer.sendMail({
       from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
       to: email,
