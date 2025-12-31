@@ -68,12 +68,12 @@ All implemented in:
 
 ### 7) Postman + frontend docs updated
 - Postman collection updated with new endpoints + `dayOfWeek` variable:
-  - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/CountWise.postman_collection.json`
+  - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/postman/CountWise.postman_collection.json`
 - Frontend-oriented API guide (lists every request in the Postman collection and explains behavior):
-  - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/FRONTEND_API_REDIRECT_GUIDE.md`
+  - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/api/FRONTEND_API_REDIRECT_GUIDE.md`
 - Additional docs updated:
-  - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/APP_SUPPORTED_ENDPOINTS.md`
-  - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/COUNTWISE_API.md`
+  - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/api/APP_SUPPORTED_ENDPOINTS.md`
+  - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/api/COUNTWISE_API.md`
 
 ## Files Touched / Added (Full Paths)
 
@@ -90,8 +90,7 @@ All implemented in:
 - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/migrations/20251228_reset_and_create_countwise_schema.sql`
 - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/migrations/20251228_seed_dev_countwise.sql`
 - `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/migrations/20251229_add_weekly_menu_template.sql`
-- `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/CountWise.postman_collection.json`
-- `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/FRONTEND_API_REDIRECT_GUIDE.md`
-- `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/APP_SUPPORTED_ENDPOINTS.md`
-- `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/COUNTWISE_API.md`
-
+- `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/postman/CountWise.postman_collection.json`
+- `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/api/FRONTEND_API_REDIRECT_GUIDE.md`
+- `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/api/APP_SUPPORTED_ENDPOINTS.md`
+- `/Users/akshitagarwal/Documents/Projects/Meal-Manager-Backend/docs/api/COUNTWISE_API.md`

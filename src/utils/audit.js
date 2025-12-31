@@ -31,4 +31,3 @@ async function writeAuditLog({ collegeId = null, actorUserId = null, action, ent
 }
 
 module.exports = { writeAuditLog, getReqMeta };
-

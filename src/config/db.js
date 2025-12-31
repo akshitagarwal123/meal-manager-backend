@@ -1,5 +1,8 @@
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
 
+// Avoid timezone confusion: treat Postgres DATE (OID 1082) as a plain YYYY-MM-DD string.
+// Without this, some environments parse DATE into a JS Date at UTC midnight, which can show as the previous day in IST.
+types.setTypeParser(1082, value => value);
 
 // Use Render's DATABASE_URL if available, fallback to local config
 let pool;

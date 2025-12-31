@@ -35,7 +35,11 @@ If your mobile app runs in Expo Go on a real device, it cannot reach your backen
 
 ## API Endpoints
 
-- See `docs/API.md`
+- See:
+  - `docs/api/COUNTWISE_API.md`
+  - `docs/api/APP_SUPPORTED_ENDPOINTS.md`
+  - `docs/postman/CountWise.postman_collection.json`
+  - Production notes: `docs/dev/PRODUCTION.md`
 
 ## What This Backend Supports (for now)
 - Student OTP login + profile
@@ -44,8 +48,11 @@ If your mobile app runs in Expo Go on a real device, it cannot reach your backen
 - QR scan attendance + manager stats
 
 ## Project Structure
-- `index.js` - Main server file
-- `routes/` - Express route handlers
+- `index.js` - Entrypoint (loads `src/server.js`)
+- `src/server.js` - Express app + middleware
+- `src/routes/` - Express route handlers
+- `src/middleware/` - Auth/logging/rate limit middleware
+- `src/utils/` - Helpers (IST date, logs, audit, etc.)
 - `migrations/` - SQL migrations (manual apply)
 
 ## License

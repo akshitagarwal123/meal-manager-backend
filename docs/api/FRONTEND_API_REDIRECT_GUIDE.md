@@ -1,6 +1,6 @@
 # CountWise Frontend API Guide (From Postman Collection)
 
-Source of truth: `docs/CountWise.postman_collection.json`
+Source of truth: `docs/postman/CountWise.postman_collection.json`
 
 Base URL: `{{baseUrl}}` (default in Postman: `http://localhost:3000`)
 
@@ -230,7 +230,7 @@ Purpose: marks attendance for today (IST) for a student in the manager’s hoste
 
 Request:
 - Header: `Authorization: Bearer {{managerToken}}`
-- Body: `{ email: "<studentEmail>", meal_type: "snacks", source: "qr" }`
+- Body: `{ qr_token: "<SIGNED_TOKEN_FROM_/user/qrcode>", meal_type: "snacks", source: "qr" }`
 
 Response:
 - `200 { message: "Attendance marked" }`
@@ -263,4 +263,3 @@ Request:
 
 Response:
 - `200 { date, meal, hostel_id, attendees: [{ email, name, phone, scanned_at }] }`
-

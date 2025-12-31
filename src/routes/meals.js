@@ -4,6 +4,7 @@ const authenticateToken = require('../middleware/authenticateToken');
 const { getISTDateString } = require('../utils/date');
 const { writeAuditLog, getReqMeta } = require('../utils/audit');
 const { flowLog, mask } = require('../utils/flowLog');
+const { respondServerError } = require('../utils/http');
 
 const router = express.Router();
 
@@ -70,7 +71,7 @@ async function upsertDateOverride(req, res) {
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (hostel_id, date, meal)
        DO UPDATE SET status = EXCLUDED.status, note = EXCLUDED.note, items = EXCLUDED.items, updated_at = now()
-       RETURNING *`,
+       RETURNING hostel_id, to_char(date::date, 'YYYY-MM-DD') AS date, meal, status, note, items, updated_at`,
       [hostelId, date, meal, status, note, JSON.stringify(items)]
     );
 
@@ -96,7 +97,7 @@ async function upsertDateOverride(req, res) {
       entityId: `${hostelId}:${date}:${meal}`,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Failed to save override', details: err.message });
+    return respondServerError(res, req, 'Failed to save override', err);
   }
 }
 
@@ -143,7 +144,7 @@ router.post('/template', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('[UPSERT TEMPLATE] Error:', err.message);
     flowLog('MEALS TEMPLATE', 'Error', { hostel_id: hostelId, day_of_week: dayOfWeek, meal_type: meal, error: err?.message || String(err) });
-    return res.status(500).json({ error: 'Failed to save weekly template', details: err.message });
+    return respondServerError(res, req, 'Failed to save weekly template', err);
   }
 });
 
@@ -180,7 +181,7 @@ router.get('/template', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('[GET TEMPLATE] Error:', err.message);
     flowLog('MEALS TEMPLATE', 'Error', { hostel_id: hostelId, error: err?.message || String(err) });
-    return res.status(500).json({ error: 'Failed to fetch weekly template', details: err.message });
+    return respondServerError(res, req, 'Failed to fetch weekly template', err);
   }
 });
 
@@ -194,7 +195,7 @@ router.get('/menu', authenticateToken, async (req, res) => {
   try {
     flowLog('MEALS MENU', 'Fetch request received', { hostel_id: hostelId, date });
     const overrideRes = await pool.query(
-      `SELECT hostel_id, date, meal, status, note, items
+      `SELECT hostel_id, to_char(date::date, 'YYYY-MM-DD') AS date, meal, status, note, items
        FROM meal_calendars
        WHERE hostel_id = $1 AND date = $2
        ORDER BY meal ASC`,
@@ -250,13 +251,66 @@ router.get('/menu', authenticateToken, async (req, res) => {
       entityId: `${hostelId}:${date}`,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Failed to fetch menu', details: err.message });
+    return respondServerError(res, req, 'Failed to fetch menu', err);
   }
 });
 
 // Date-specific override (exceptions) for a hostel/date/meal (manager only).
 // POST /meals/override  (preferred)
 router.post('/override', authenticateToken, upsertDateOverride);
+
+// Delete a date-specific override so reads fall back to weekly template (manager only).
+// DELETE /meals/override?hostel_id=<id>&date=YYYY-MM-DD&meal_type=<breakfast|lunch|snacks|dinner>
+router.delete('/override', authenticateToken, async (req, res) => {
+  const hostelId = req.query.hostel_id;
+  const date = req.query.date;
+  const meal = normalizeMeal(req.query.meal_type ?? req.query.meal);
+
+  if (!hostelId || !date || !meal) {
+    return res.status(400).json({ error: 'hostel_id, date, and meal_type are required as query params' });
+  }
+
+  try {
+    flowLog('MEALS OVERRIDE', 'Delete request received', { hostel_id: hostelId, date, meal_type: meal });
+    const gate = await requireManagerForHostel({ req, hostelId });
+    if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+    const result = await pool.query(
+      `DELETE FROM meal_calendars
+       WHERE hostel_id = $1 AND date = $2 AND meal = $3
+       RETURNING hostel_id, to_char(date::date, 'YYYY-MM-DD') AS date, meal`,
+      [hostelId, date, meal]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Override not found' });
+    }
+
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: gate.userId,
+      action: 'MEALS_DATE_OVERRIDE_DELETE',
+      entityType: 'meal_calendar',
+      entityId: `${hostelId}:${date}:${meal}`,
+      details: { ...getReqMeta(req) },
+    });
+
+    flowLog('MEALS OVERRIDE', 'Deleted', { hostel_id: hostelId, date, meal_type: meal });
+    return res.json({ success: true, message: 'Override removed', override: result.rows[0] });
+  } catch (err) {
+    console.error('[DELETE OVERRIDE] Error:', err.message);
+    flowLog('MEALS OVERRIDE', 'Delete error', { hostel_id: hostelId, date, meal_type: meal, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: req.user?.id ?? null,
+      action: 'MEALS_DATE_OVERRIDE_DELETE_ERROR',
+      entityType: 'meal_calendar',
+      entityId: `${hostelId}:${date}:${meal}`,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return respondServerError(res, req, 'Failed to delete override', err);
+  }
+});
 
 // Backward-compatible alias (older clients).
 // POST /meals/menu
@@ -318,7 +372,7 @@ router.delete('/menu/item', authenticateToken, async (req, res) => {
       entityId: `${hostelId}:${date}:${meal}`,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Failed to delete item', details: err.message });
+    return respondServerError(res, req, 'Failed to delete item', err);
   }
 });
 

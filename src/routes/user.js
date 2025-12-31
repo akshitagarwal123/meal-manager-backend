@@ -1,9 +1,11 @@
 const express = require('express');
+const jwt = require('jsonwebtoken');
 const pool = require('../config/db');
 const authenticateToken = require('../middleware/authenticateToken');
 const { getISTDateString } = require('../utils/date');
 const { writeAuditLog, getReqMeta } = require('../utils/audit');
 const { flowLog, mask } = require('../utils/flowLog');
+const { respondServerError } = require('../utils/http');
 
 const router = express.Router();
 
@@ -22,6 +24,102 @@ async function getActiveHostelAssignment({ userId, date }) {
   );
   return result.rows?.[0]?.hostel_id ?? null;
 }
+
+async function getActiveManagerHostel({ userId, date }) {
+  const result = await pool.query(
+    `SELECT hostel_id
+     FROM hostel_staff
+     WHERE user_id = $1
+       AND start_date <= $2
+       AND (end_date IS NULL OR end_date >= $2)
+     ORDER BY start_date DESC
+     LIMIT 1`,
+    [userId, date]
+  );
+  return result.rows?.[0]?.hostel_id ?? null;
+}
+
+// Return the authenticated user's profile + current hostel (IST).
+router.get('/me', authenticateToken, async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  try {
+    flowLog('USER ME', 'Request received', { email: req.user?.email });
+    const today = getISTDateString();
+    const userRes = await pool.query(
+      `SELECT u.id, u.email, u.name, u.phone, u.role, u.roll_no, u.room_no, u.college_id, u.is_active,
+              c.code AS college_code, c.name AS college_name
+       FROM users u
+       LEFT JOIN colleges c ON c.id = u.college_id
+       WHERE u.id = $1
+       LIMIT 1`,
+      [userId]
+    );
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    const u = userRes.rows[0];
+    if (u.is_active === false) return res.status(403).json({ error: 'User is inactive' });
+
+    const hostelId =
+      u.role === 'manager'
+        ? await getActiveManagerHostel({ userId, date: today })
+        : await getActiveHostelAssignment({ userId, date: today });
+
+    let hostel = null;
+    if (hostelId) {
+      const hostelRes = await pool.query(
+        `SELECT id, hostel_code, name, address, college_id
+         FROM hostels
+         WHERE id = $1
+         LIMIT 1`,
+        [hostelId]
+      );
+      hostel = hostelRes.rows?.[0] ?? null;
+    }
+
+    await writeAuditLog({
+      collegeId: u.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_ME',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), hostel_id: hostelId ?? null },
+    });
+
+    flowLog('USER ME', 'Returned', { email: u.email, hostel_id: hostelId ?? '' });
+    return res.json({
+      success: true,
+      user: {
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        phone: u.phone,
+        role: u.role,
+        roll_no: u.roll_no,
+        room_no: u.room_no,
+        college_id: u.college_id,
+      },
+      college: u.college_id
+        ? { id: u.college_id, code: u.college_code ?? null, name: u.college_name ?? null }
+        : null,
+      hostel_id: hostelId ?? null,
+      hostel,
+    });
+  } catch (err) {
+    console.error('[USER ME] Error:', err.message);
+    flowLog('USER ME', 'Error', { email: req.user?.email, error: err?.message || String(err) });
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: userId,
+      action: 'USER_ME_ERROR',
+      entityType: 'api',
+      entityId: '/user/me',
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return respondServerError(res, req, 'Server error', err);
+  }
+});
 
 // List hostels for selection (legacy path kept: /user/pgs).
 router.get('/pgs', authenticateToken, async (req, res) => {
@@ -64,7 +162,7 @@ router.get('/pgs', authenticateToken, async (req, res) => {
       entityId: '/user/pgs',
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    res.status(500).json({ error: 'Failed to fetch hostels', details: err.message });
+    return respondServerError(res, req, 'Failed to fetch hostels', err);
   }
 });
 
@@ -149,7 +247,7 @@ router.put('/update-details', authenticateToken, async (req, res) => {
       entityId: userId,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Failed to update user details', details: err.message });
+    return respondServerError(res, req, 'Failed to update user details', err);
   }
 });
 
@@ -184,7 +282,7 @@ router.post('/saveDeviceToken', authenticateToken, async (req, res) => {
       entityId: userId,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Server error', details: err.message });
+    return respondServerError(res, req, 'Server error', err);
   }
 });
 
@@ -254,7 +352,7 @@ router.post('/enroll', authenticateToken, async (req, res) => {
       entityId: userId,
       details: { ...getReqMeta(req), error: err?.message || String(err), hostel_id: hostelId },
     });
-    return res.status(500).json({ error: 'Server error', details: err.message });
+    return respondServerError(res, req, 'Server error', err);
   }
 });
 
@@ -269,7 +367,18 @@ router.get('/qrcode', authenticateToken, async (req, res) => {
     const today = getISTDateString();
     const hostelId = await getActiveHostelAssignment({ userId, date: today });
     const QRCode = require('qrcode');
-    const payload = { user_id: userId, email, hostel_id: hostelId };
+    const ttlSeconds = Number(process.env.QR_TOKEN_TTL_SECONDS || 30);
+    const tokenSecret = process.env.QR_TOKEN_SECRET || process.env.JWT_SECRET;
+    if (!tokenSecret) return respondServerError(res, req, 'Server error', new Error('QR_TOKEN_SECRET/JWT_SECRET not set'));
+
+    // Signed, short-lived token for dynamic QR.
+    const qrToken = jwt.sign(
+      { typ: 'qr', user_id: userId, email, hostel_id: hostelId ?? null },
+      tokenSecret,
+      { expiresIn: ttlSeconds }
+    );
+
+    const payload = { qr_token: qrToken };
     const qr = await QRCode.toDataURL(JSON.stringify(payload));
     await writeAuditLog({
       collegeId: req.user?.college_id ?? null,
@@ -279,8 +388,8 @@ router.get('/qrcode', authenticateToken, async (req, res) => {
       entityId: userId,
       details: { ...getReqMeta(req), hostel_id: hostelId ?? null },
     });
-    flowLog('QRCODE', 'Generated', { email, hostel_id: hostelId ?? '' });
-    return res.json({ qr, payload });
+    flowLog('QRCODE', 'Generated', { email, hostel_id: hostelId ?? '', ttl_seconds: String(ttlSeconds) });
+    return res.json({ qr, payload, expires_in_seconds: ttlSeconds });
   } catch (err) {
     flowLog('QRCODE', 'Error', { email, error: err?.message || String(err) });
     await writeAuditLog({
@@ -291,7 +400,7 @@ router.get('/qrcode', authenticateToken, async (req, res) => {
       entityId: userId,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Failed to generate QR', details: err.message });
+    return respondServerError(res, req, 'Failed to generate QR', err);
   }
 });
 
@@ -307,7 +416,7 @@ router.get('/assigned-meals', authenticateToken, async (req, res) => {
     if (!hostelId) return res.status(403).json({ error: 'User not enrolled in any hostel' });
 
     const daysRes = await pool.query(
-      `SELECT d::date AS date, EXTRACT(DOW FROM d)::int AS dow
+      `SELECT to_char(d::date, 'YYYY-MM-DD') AS date, EXTRACT(DOW FROM d)::int AS dow
        FROM generate_series($1::date, ($1::date + INTERVAL '6 day')::date, INTERVAL '1 day') d`,
       [today]
     );
@@ -321,7 +430,7 @@ router.get('/assigned-meals', authenticateToken, async (req, res) => {
     const templates = new Map(templateRes.rows.map(r => [`${r.day_of_week}:${r.meal}`, r]));
 
     const overrideRes = await pool.query(
-      `SELECT date, meal, status, note, items
+      `SELECT to_char(date::date, 'YYYY-MM-DD') AS date, meal, status, note, items
        FROM meal_calendars
        WHERE hostel_id = $1
          AND date >= $2::date
@@ -359,7 +468,14 @@ router.get('/assigned-meals', authenticateToken, async (req, res) => {
       details: { ...getReqMeta(req), from: today, returned: meals.length, overrides: overrideRes.rows.length },
     });
     flowLog('ASSIGNED MEALS', 'Returned', { hostel_id: hostelId, days: 7, overrides: overrideRes.rows.length });
-    return res.json({ hostel_id: hostelId, from: today, to: null, meals });
+
+    const responseBody = { hostel_id: hostelId, from: today, to: null, meals };
+    if (String(process.env.LOG_ASSIGNED_MEALS_RESPONSE ?? 'false').toLowerCase() === 'true') {
+      const max = Number(process.env.LOG_RESPONSE_MAX_CHARS || 8000);
+      const text = JSON.stringify(responseBody);
+      console.log('[ASSIGNED MEALS] Response:', text.length > max ? text.slice(0, max) + '...(truncated)' : text);
+    }
+    return res.json(responseBody);
   } catch (err) {
     console.error('[ASSIGNED MEALS] Error:', err.message);
     flowLog('ASSIGNED MEALS', 'Error', { email: req.user?.email, error: err?.message || String(err) });
@@ -371,7 +487,7 @@ router.get('/assigned-meals', authenticateToken, async (req, res) => {
       entityId: userId,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Server error', details: err.message });
+    return respondServerError(res, req, 'Server error', err);
   }
 });
 
@@ -384,44 +500,119 @@ router.get('/stats', authenticateToken, async (req, res) => {
   const to = req.query.to;
   if (!from || !to) return res.status(400).json({ error: 'from and to are required (YYYY-MM-DD)' });
 
+  const isValidDate = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+  if (!isValidDate(from) || !isValidDate(to)) return res.status(400).json({ error: 'from and to must be YYYY-MM-DD' });
+
   try {
     flowLog('STATS', 'Request received', { email: req.user?.email, from, to });
-    const hostelId = await getActiveHostelAssignment({ userId, date: to });
-    if (!hostelId) return res.status(403).json({ error: 'User not enrolled in any hostel' });
+    const today = getISTDateString();
+    const toCapped = to > today ? today : to;
+    if (from > toCapped) return res.status(400).json({ error: 'from must be <= to (after capping to today)' });
 
-    const attendedRes = await pool.query(
-      `SELECT meal, COUNT(*)::int AS attended
-       FROM attendance_scans
-       WHERE user_id = $1 AND hostel_id = $2 AND date >= $3 AND date <= $4
-       GROUP BY meal`,
-      [userId, hostelId, from, to]
+    // Ensure the user is assigned to a hostel for at least one date in range.
+    const assignedCountRes = await pool.query(
+      `WITH days AS (
+         SELECT d::date AS date
+         FROM generate_series($1::date, $2::date, INTERVAL '1 day') d
+       )
+       SELECT COUNT(*)::int AS assigned_days
+       FROM days
+       JOIN LATERAL (
+         SELECT hostel_id
+         FROM user_hostel_assignments
+         WHERE user_id = $3
+           AND start_date <= days.date
+           AND (end_date IS NULL OR end_date >= days.date)
+         ORDER BY start_date DESC
+         LIMIT 1
+       ) a ON true`,
+      [from, toCapped, userId]
     );
+    const assignedDays = assignedCountRes.rows?.[0]?.assigned_days ?? 0;
+    if (!assignedDays) return res.status(403).json({ error: 'User not enrolled in any hostel' });
 
-    const possibleRes = await pool.query(
-      `SELECT meal, COUNT(*)::int AS possible
-       FROM meal_calendars
-       WHERE hostel_id = $1 AND date >= $2 AND date <= $3 AND status <> 'holiday'
-       GROUP BY meal`,
-      [hostelId, from, to]
+    const statsRes = await pool.query(
+      `WITH days AS (
+         SELECT d::date AS date, EXTRACT(DOW FROM d)::int AS dow
+         FROM generate_series($1::date, $2::date, INTERVAL '1 day') d
+       ),
+       assigned AS (
+         SELECT days.date, days.dow,
+                (
+                  SELECT hostel_id
+                  FROM user_hostel_assignments
+                  WHERE user_id = $3
+                    AND start_date <= days.date
+                    AND (end_date IS NULL OR end_date >= days.date)
+                  ORDER BY start_date DESC
+                  LIMIT 1
+                ) AS hostel_id
+         FROM days
+       ),
+       assigned_days AS (
+         SELECT date, dow, hostel_id
+         FROM assigned
+         WHERE hostel_id IS NOT NULL
+       ),
+       meal_types AS (
+         SELECT * FROM (VALUES ('breakfast'::text), ('lunch'::text), ('snacks'::text), ('dinner'::text)) AS t(meal)
+       ),
+       merged AS (
+         SELECT ad.date,
+                ad.hostel_id,
+                mt.meal,
+                COALESCE(mc.status, twm.status, 'open') AS status
+         FROM assigned_days ad
+         CROSS JOIN meal_types mt
+         LEFT JOIN meal_calendars mc
+           ON mc.hostel_id = ad.hostel_id AND mc.date = ad.date AND mc.meal = mt.meal
+         LEFT JOIN hostel_weekly_menus twm
+           ON twm.hostel_id = ad.hostel_id AND twm.day_of_week = ad.dow AND twm.meal = mt.meal
+       ),
+       eligible AS (
+         SELECT meal, SUM((status = 'open')::int)::int AS eligible
+         FROM merged
+         GROUP BY meal
+       ),
+       attended AS (
+         SELECT a.meal, COUNT(*)::int AS attended
+         FROM attendance_scans a
+         JOIN assigned_days ad
+           ON ad.date = a.date AND ad.hostel_id = a.hostel_id
+         WHERE a.user_id = $3
+           AND a.date >= $1::date AND a.date <= $2::date
+         GROUP BY a.meal
+       )
+       SELECT mt.meal,
+              COALESCE(attended.attended, 0)::int AS attended,
+              COALESCE(eligible.eligible, 0)::int AS eligible
+       FROM meal_types mt
+       LEFT JOIN attended USING (meal)
+       LEFT JOIN eligible USING (meal)`,
+      [from, toCapped, userId]
     );
 
     const attended = Object.fromEntries(MEAL_TYPES.map(m => [m, 0]));
-    const possible = Object.fromEntries(MEAL_TYPES.map(m => [m, 0]));
+    const eligible = Object.fromEntries(MEAL_TYPES.map(m => [m, 0]));
+    for (const row of statsRes.rows) {
+      if (attended[row.meal] !== undefined) attended[row.meal] = row.attended;
+      if (eligible[row.meal] !== undefined) eligible[row.meal] = row.eligible;
+    }
 
-    for (const row of attendedRes.rows) if (attended[row.meal] !== undefined) attended[row.meal] = row.attended;
-    for (const row of possibleRes.rows) if (possible[row.meal] !== undefined) possible[row.meal] = row.possible;
+    const missed = Object.fromEntries(MEAL_TYPES.map(m => [m, Math.max(0, (eligible[m] || 0) - (attended[m] || 0))]));
 
-    const missed = Object.fromEntries(MEAL_TYPES.map(m => [m, Math.max(0, (possible[m] || 0) - (attended[m] || 0))]));
+    // Keep existing response shape (hostel_id is the user's active hostel on the capped "to" date).
+    const hostelId = await getActiveHostelAssignment({ userId, date: toCapped });
     await writeAuditLog({
       collegeId: req.user?.college_id ?? null,
       actorUserId: userId,
       action: 'USER_STATS',
       entityType: 'user',
       entityId: userId,
-      details: { ...getReqMeta(req), from, to, hostel_id: hostelId },
+      details: { ...getReqMeta(req), from, to: toCapped, hostel_id: hostelId, assigned_days: assignedDays },
     });
-    flowLog('STATS', 'Returned', { email: req.user?.email, hostel_id: hostelId });
-    return res.json({ from, to, hostel_id: hostelId, attended, missed });
+    flowLog('STATS', 'Returned', { email: req.user?.email, hostel_id: hostelId, assigned_days: assignedDays });
+    return res.json({ from, to: toCapped, hostel_id: hostelId, attended, missed });
   } catch (err) {
     console.error('[STATS] Error:', err.message);
     flowLog('STATS', 'Error', { email: req.user?.email, error: err?.message || String(err) });
@@ -433,7 +624,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
       entityId: userId,
       details: { ...getReqMeta(req), error: err?.message || String(err), from, to },
     });
-    return res.status(500).json({ error: 'Server error', details: err.message });
+    return respondServerError(res, req, 'Server error', err);
   }
 });
 

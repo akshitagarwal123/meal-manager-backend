@@ -35,6 +35,27 @@ Notes:
 
 ## Auth (OTP)
 
+### `POST /auth/user-exists`
+Quick check to validate an email before starting OTP flow.
+
+**Request body**
+```json
+{ "email": "user@example.com" }
+```
+
+**Response 200 (exists)**
+```json
+{ "exists": true, "user_id": 123, "role": "student" }
+```
+
+**Response 200 (not exists)**
+```json
+{ "exists": false }
+```
+
+**Errors**
+- `400` `{"error":"Invalid email"}`
+
 ### `POST /auth/send-otp`
 **Request body**
 ```json
@@ -84,16 +105,16 @@ Notes:
 ### `POST /auth/save-details`
 Updates an existing student profile (and optionally sets current hostel assignment).
 
+Auth: Required (`Authorization: Bearer <JWT>`)
+
 **Request body**
 ```json
 {
   "name": "Student Name",
-  "email": "student@example.com",
   "phone": "9999999999",
   "roll_no": "R123",
   "room_no": "A-101",
-  "college_id": 1,
-  "hostel_id": 1
+  "college_id": 1
 }
 ```
 
@@ -103,7 +124,10 @@ Updates an existing student profile (and optionally sets current hostel assignme
 ```
 
 **Errors**
-- `400` `{"error":"name (or username) and email are required"}`
+- `401` `{"error":"Unauthorized"}`
+- `400` `{"error":"name (or username) is required"}`
+- `400` `{"error":"email cannot be changed"}`
+- `400` `{"error":"hostel_id cannot be set here"}`
 - `404` `{"error":"User not found"}`
 - `403` `{"error":"User is inactive"}`
 - `500` `{"error":"Failed to save user details","details":"..."}`
@@ -111,6 +135,35 @@ Updates an existing student profile (and optionally sets current hostel assignme
 ---
 
 ## Student APIs (`/user`) (Auth Required)
+
+### `GET /user/me`
+Returns the authenticated user profile + college + current hostel (if assigned).
+
+**Response 200**
+```json
+{
+  "success": true,
+  "user": {
+    "id": 123,
+    "email": "student@example.com",
+    "name": "Akshit Agarwal",
+    "phone": "7505170242",
+    "role": "student",
+    "roll_no": "2022UCE1102",
+    "room_no": "H9/A/1/101/B1",
+    "college_id": 1
+  },
+  "college": { "id": 1, "code": "MNIT", "name": "MNIT" },
+  "hostel_id": 3,
+  "hostel": { "id": 3, "hostel_code": "AUROBINDO", "name": "Aurobindo", "address": "Campus", "college_id": 1 }
+}
+```
+
+**Errors**
+- `401` `{"error":"Unauthorized"}`
+- `403` `{"error":"User is inactive"}`
+- `404` `{"error":"User not found"}`
+- `500` `{"error":"Server error","details":"..."}`
 
 ### `GET /user/pgs`
 Lists hostels (legacy route name kept).
@@ -170,13 +223,14 @@ Sets the student’s current hostel assignment.
 ```
 
 ### `GET /user/qrcode`
-Generates a QR code containing student identity (payload includes `user_id`, `email`, and current `hostel_id` if assigned).
+Generates a **dynamic** QR code containing a short-lived signed token.
 
 **Response 200**
 ```json
 {
   "qr": "data:image/png;base64,...",
-  "payload": { "user_id": 1, "email": "student@example.com", "hostel_id": 1 }
+  "payload": { "qr_token": "<SIGNED_TOKEN>" },
+  "expires_in_seconds": 30
 }
 ```
 
@@ -294,6 +348,21 @@ Date-specific override (exceptions). Writes into `meal_calendars`.
 { "success": true, "override": { "id": 1, "hostel_id": 1, "date": "2025-01-01", "meal": "snacks", "status": "open", "note": "Tea at 5", "items": ["Tea","Biscuits"] } }
 ```
 
+### `DELETE /meals/override?hostel_id=1&date=YYYY-MM-DD&meal_type=snacks` (manager only)
+Reverts a date-specific override back to the weekly default by deleting the override row from `meal_calendars`.
+
+**Response 200**
+```json
+{
+  "success": true,
+  "message": "Override removed",
+  "override": { "hostel_id": 1, "date": "2025-01-01", "meal": "snacks" }
+}
+```
+
+**Errors**
+- `404` `{"error":"Override not found"}`
+
 ### `POST /meals/menu` (manager only, alias)
 Same as `POST /meals/override` (kept for backward compatibility).
 
@@ -355,7 +424,7 @@ Marks attendance for **today (IST)**.
 
 **Request body**
 ```json
-{ "email": "student@example.com", "meal_type": "snacks", "source": "qr" }
+{ "qr_token": "<SIGNED_TOKEN_FROM_/user/qrcode>", "meal_type": "snacks", "source": "qr" }
 ```
 
 **Response 200**

@@ -5,8 +5,26 @@ const transporter = require('../config/email');
 const { getISTDateString } = require('../utils/date');
 const { writeAuditLog, getReqMeta } = require('../utils/audit');
 const { flowLog, mask } = require('../utils/flowLog');
+const authenticateToken = require('../middleware/authenticateToken');
+const { createRateLimiter } = require('../middleware/rateLimit');
+const { respondServerError, shouldExposeErrors } = require('../utils/http');
 
 const router = express.Router();
+
+// Simple in-memory throttles (for multi-instance production, prefer a shared store like Redis).
+const limitAuthExist = createRateLimiter({ windowMs: 60_000, max: 60, keyPrefix: 'auth:user-exists' });
+const limitSendOtp = createRateLimiter({ windowMs: 10 * 60_000, max: 5, keyPrefix: 'auth:send-otp' });
+const limitVerifyOtp = createRateLimiter({ windowMs: 10 * 60_000, max: 10, keyPrefix: 'auth:verify-otp' });
+const limitSaveDetails = createRateLimiter({ windowMs: 60_000, max: 30, keyPrefix: 'auth:save-details' });
+
+function isValidEmail(email) {
+  if (typeof email !== 'string') return false;
+  const trimmed = email.trim();
+  if (!trimmed) return false;
+  // Pragmatic validation (avoid overly strict RFC rules).
+  if (trimmed.length > 254) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed);
+}
 
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -89,10 +107,43 @@ async function getActiveManagerHostel({ userId, date }) {
   return result.rows?.[0]?.hostel_id ?? null;
 }
 
-// Send OTP to email (stored in audit_logs.details for verification).
-router.post('/send-otp', async (req, res) => {
+// Quick check used by frontend to validate an email before OTP flow.
+// POST /auth/user-exists  { "email": "user@example.com" }
+router.post('/user-exists', limitAuthExist, async (req, res) => {
   const email = req.body?.email;
-  if (!email) {
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Invalid email' });
+
+  const normalized = String(email).trim().toLowerCase();
+
+  try {
+    flowLog('USER EXISTS', 'Request received', { email: normalized });
+    const result = await pool.query('SELECT id, role FROM users WHERE email = $1 LIMIT 1', [normalized]);
+    const row = result.rows?.[0];
+
+    await writeAuditLog({
+      action: 'AUTH_USER_EXISTS',
+      entityType: 'user',
+      entityId: normalized,
+      details: { ...getReqMeta(req), exists: Boolean(row), role: row?.role ?? null },
+    });
+
+    if (!row) return res.json({ exists: false });
+    return res.json({ exists: true, user_id: row.id, role: row.role });
+  } catch (err) {
+    await writeAuditLog({
+      action: 'AUTH_USER_EXISTS_ERROR',
+      entityType: 'user',
+      entityId: normalized,
+      details: { ...getReqMeta(req), error: err?.message || String(err) },
+    });
+    return respondServerError(res, req, 'Server error', err);
+  }
+});
+
+// Send OTP to email (stored in audit_logs.details for verification).
+router.post('/send-otp', limitSendOtp, async (req, res) => {
+  const email = req.body?.email;
+  if (!isValidEmail(email)) {
     flowLog('SEND OTP', 'Request rejected (missing email)');
     req.log?.info('auth.send_otp.rejected', { reason: 'email_required' });
     await writeAuditLog({
@@ -102,7 +153,7 @@ router.post('/send-otp', async (req, res) => {
       details: { ...getReqMeta(req), reason: 'email_required' },
     });
     req.setLogSummary?.('OTP request rejected (missing email)');
-    return res.status(400).json({ error: 'Email required' });
+    return res.status(400).json({ error: 'Invalid email' });
   }
 
   flowLog('SEND OTP', 'Request received', { email });
@@ -196,16 +247,16 @@ router.post('/send-otp', async (req, res) => {
         message: 'OTP generated (email delivery unavailable on this network)',
         otp,
         emailDelivery: 'failed',
-        details,
+        ...(shouldExposeErrors() ? { details } : {}),
       });
     }
 
-    return res.status(500).json({ error: 'Failed to send OTP', details });
+    return res.status(500).json({ error: 'Failed to send OTP', ...(shouldExposeErrors() ? { details } : {}) });
   }
 });
 
 // Verify OTP, return token if user exists.
-router.post('/verify-otp', async (req, res) => {
+router.post('/verify-otp', limitVerifyOtp, async (req, res) => {
   const email = req.body?.email;
   const otp = req.body?.otp;
   if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
@@ -264,25 +315,24 @@ router.post('/verify-otp', async (req, res) => {
       entityId: email,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Failed to verify OTP', details: err.message });
+    return respondServerError(res, req, 'Failed to verify OTP', err);
   }
 });
 
-// Save student profile details (creates or updates) and returns token.
-router.post('/save-details', async (req, res) => {
-  const { name, username, email, phone, roll_no, room_no, college_id } = req.body || {};
-  const hostelId = req.body?.hostel_id;
+// Save student profile details for the authenticated user and return a refreshed token.
+// POST /auth/save-details (auth)
+router.post('/save-details', authenticateToken, limitSaveDetails, async (req, res) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
+  const { name, username, phone, roll_no, room_no, college_id } = req.body || {};
   const finalName = name || username;
-  if (!finalName || !email) return res.status(400).json({ error: 'name (or username) and email are required' });
+  if (!finalName) return res.status(400).json({ error: 'name (or username) is required' });
+  if (req.body?.email) return res.status(400).json({ error: 'email cannot be changed' });
+  if (req.body?.hostel_id) return res.status(400).json({ error: 'hostel_id cannot be set here' });
 
   try {
-    req.log?.info('auth.save_details.start', { email, hostel_id: hostelId ?? null });
-    const existingRes = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    let userRow;
-
-    if (existingRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-
+    req.log?.info('auth.save_details.start', { user_id: userId });
     const updated = await pool.query(
       `UPDATE users
        SET college_id = COALESCE($1, college_id),
@@ -290,34 +340,16 @@ router.post('/save-details', async (req, res) => {
            phone = COALESCE($3, phone),
            roll_no = COALESCE($4, roll_no),
            room_no = COALESCE($5, room_no)
-       WHERE email = $6
+       WHERE id = $6
        RETURNING *`,
-      [college_id ?? null, finalName, phone ?? null, roll_no ?? null, room_no ?? null, email]
+      [college_id ?? null, finalName, phone ?? null, roll_no ?? null, room_no ?? null, userId]
     );
-    userRow = updated.rows[0];
+    if (updated.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+    const userRow = updated.rows[0];
     if (userRow.is_active === false) return res.status(403).json({ error: 'User is inactive' });
 
-    // Optional: save hostel assignment if provided.
     const today = getISTDateString();
-    let activeHostelId = await getActiveHostelAssignment({ userId: userRow.id, date: today });
-    if (hostelId) {
-      if (!activeHostelId || String(activeHostelId) !== String(hostelId)) {
-        if (activeHostelId) {
-          await pool.query(
-            `UPDATE user_hostel_assignments
-             SET end_date = ($2::date - INTERVAL '1 day')::date
-             WHERE user_id = $1 AND hostel_id = $3 AND end_date IS NULL`,
-            [userRow.id, today, activeHostelId]
-          );
-        }
-        await pool.query(
-          `INSERT INTO user_hostel_assignments (user_id, hostel_id, start_date, end_date, reason)
-           VALUES ($1, $2, $3, NULL, $4)`,
-          [userRow.id, hostelId, today, 'profile-setup']
-        );
-        activeHostelId = hostelId;
-      }
-    }
+    const activeHostelId = await getActiveHostelAssignment({ userId: userRow.id, date: today });
 
     const token = signAppToken({ userRow, hostelId: activeHostelId });
     req.log?.info('auth.save_details.success', { user_id: userRow.id, hostel_id: activeHostelId ?? null });
@@ -348,10 +380,10 @@ router.post('/save-details', async (req, res) => {
     await writeAuditLog({
       action: 'AUTH_SAVE_DETAILS_ERROR',
       entityType: 'user',
-      entityId: email,
+      entityId: String(userId),
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
-    return res.status(500).json({ error: 'Failed to save user details', details: err.message });
+    return respondServerError(res, req, 'Failed to save user details', err);
   }
 });
 

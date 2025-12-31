@@ -33,6 +33,33 @@
 			"name": "Auth (OTP)",
 			"item": [
 				{
+					"name": "POST /auth/user-exists",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"email\": \"{{studentEmail}}\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/auth/user-exists",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"auth",
+								"user-exists"
+							]
+						}
+					},
+					"response": []
+				},
+				{
 					"name": "POST /auth/send-otp (Student)",
 					"request": {
 						"method": "POST",
@@ -86,9 +113,9 @@
 					},
 					"response": []
 				},
-				{
-					"name": "POST /auth/save-details (Student profile + optional hostel assignment)",
-					"event": [
+					{
+						"name": "POST /auth/save-details (Student profile)",
+						"event": [
 						{
 							"listen": "test",
 							"script": {
@@ -102,20 +129,24 @@
 							}
 						}
 					],
-					"request": {
-						"method": "POST",
-						"header": [
-							{
-								"key": "Content-Type",
-								"value": "application/json"
-							}
-						],
-						"body": {
-							"mode": "raw",
-							"raw": "{\n  \"name\": \"Student Name\",\n  \"email\": \"{{studentEmail}}\",\n  \"phone\": \"9999999999\",\n  \"roll_no\": \"R123\",\n  \"room_no\": \"A-101\",\n  \"college_id\": {{collegeId}},\n  \"hostel_id\": {{hostelId}}\n}"
-						},
-						"url": {
-							"raw": "{{baseUrl}}/auth/save-details",
+						"request": {
+							"method": "POST",
+							"header": [
+								{
+									"key": "Content-Type",
+									"value": "application/json"
+								},
+								{
+									"key": "Authorization",
+									"value": "Bearer {{studentToken}}"
+								}
+							],
+							"body": {
+								"mode": "raw",
+								"raw": "{\n  \"name\": \"Student Name\",\n  \"phone\": \"9999999999\",\n  \"roll_no\": \"R123\",\n  \"room_no\": \"A-101\",\n  \"college_id\": {{collegeId}}\n}"
+							},
+							"url": {
+								"raw": "{{baseUrl}}/auth/save-details",
 							"host": [
 								"{{baseUrl}}"
 							],
@@ -156,15 +187,38 @@
 				}
 			]
 		},
-		{
-			"name": "Student (Auth)",
-			"item": [
-				{
-					"name": "GET /user/qrcode",
-					"request": {
-						"method": "GET",
-						"header": [
-							{
+			{
+				"name": "Student (Auth)",
+				"item": [
+					{
+						"name": "GET /user/me",
+						"request": {
+							"method": "GET",
+							"header": [
+								{
+									"key": "Authorization",
+									"value": "Bearer {{studentToken}}"
+								}
+							],
+							"url": {
+								"raw": "{{baseUrl}}/user/me",
+								"host": [
+									"{{baseUrl}}"
+								],
+								"path": [
+									"user",
+									"me"
+								]
+							}
+						},
+						"response": []
+					},
+					{
+						"name": "GET /user/qrcode",
+						"request": {
+							"method": "GET",
+							"header": [
+								{
 								"key": "Authorization",
 								"value": "Bearer {{studentToken}}"
 							}
@@ -179,12 +233,12 @@
 								"qrcode"
 							]
 						}
+						},
+						"response": []
 					},
-					"response": []
-				},
-				{
-					"name": "GET /user/assigned-meals",
-					"request": {
+					{
+						"name": "GET /user/assigned-meals",
+						"request": {
 						"method": "GET",
 						"header": [
 							{
@@ -368,10 +422,10 @@
 					},
 					"response": []
 				},
-				{
-					"name": "POST /meals/override (Date override)",
-					"request": {
-						"method": "POST",
+					{
+						"name": "POST /meals/override (Date override)",
+						"request": {
+							"method": "POST",
 						"header": [
 							{
 								"key": "Content-Type",
@@ -396,13 +450,50 @@
 								"override"
 							]
 						}
+						},
+						"response": []
 					},
-					"response": []
-				},
-				{
-					"name": "POST /meals/menu (Alias of /meals/override)",
-					"request": {
-						"method": "POST",
+					{
+						"name": "DELETE /meals/override (Revert to weekly default)",
+						"request": {
+							"method": "DELETE",
+							"header": [
+								{
+									"key": "Authorization",
+									"value": "Bearer {{managerToken}}"
+								}
+							],
+							"url": {
+								"raw": "{{baseUrl}}/meals/override?hostel_id={{hostelId}}&date={{date}}&meal_type=snacks",
+								"host": [
+									"{{baseUrl}}"
+								],
+								"path": [
+									"meals",
+									"override"
+								],
+								"query": [
+									{
+										"key": "hostel_id",
+										"value": "{{hostelId}}"
+									},
+									{
+										"key": "date",
+										"value": "{{date}}"
+									},
+									{
+										"key": "meal_type",
+										"value": "snacks"
+									}
+								]
+							}
+						},
+						"response": []
+					},
+					{
+						"name": "POST /meals/menu (Alias of /meals/override)",
+						"request": {
+							"method": "POST",
 						"header": [
 							{
 								"key": "Content-Type",
@@ -475,15 +566,15 @@
 								"key": "Authorization",
 								"value": "Bearer {{managerToken}}"
 							}
-						],
-						"body": {
-							"mode": "raw",
-							"raw": "{\n  \"email\": \"{{studentEmail}}\",\n  \"meal_type\": \"snacks\",\n  \"source\": \"qr\"\n}"
-						},
-						"url": {
-							"raw": "{{baseUrl}}/admin/mark-attendance",
-							"host": [
-								"{{baseUrl}}"
+							],
+							"body": {
+								"mode": "raw",
+								"raw": "{\n  \"qr_token\": \"{{qrToken}}\",\n  \"meal_type\": \"snacks\",\n  \"source\": \"qr\"\n}"
+							},
+							"url": {
+								"raw": "{{baseUrl}}/admin/mark-attendance",
+								"host": [
+									"{{baseUrl}}"
 							],
 							"path": [
 								"admin",
@@ -658,6 +749,10 @@
 		{
 			"key": "otp",
 			"value": "123456"
+		},
+		{
+			"key": "qrToken",
+			"value": ""
 		}
 	]
 }

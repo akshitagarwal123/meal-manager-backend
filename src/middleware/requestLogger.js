@@ -13,6 +13,16 @@ function shouldLog() {
   return v !== 'false' && v !== '0' && v !== 'no' && v !== 'off';
 }
 
+function getMode() {
+  const explicit = process.env.LOG_REQUESTS_MODE;
+  if (explicit) return String(explicit).toLowerCase();
+
+  // Backward compatible behavior: previously LOG_REQUESTS doubled as mode.
+  const legacy = String(process.env.LOG_REQUESTS ?? '').toLowerCase();
+  if (legacy === 'json' || legacy === 'summary') return legacy;
+  return 'summary';
+}
+
 function safeKeys(obj) {
   if (!obj || typeof obj !== 'object') return [];
   return Object.keys(obj).slice(0, 20);
@@ -21,7 +31,7 @@ function safeKeys(obj) {
 function requestLogger(req, res, next) {
   if (!shouldLog()) return next();
 
-  const mode = String(process.env.LOG_REQUESTS ?? 'summary').toLowerCase(); // summary | json | true
+  const mode = getMode(); // summary | json
   const requestId = makeRequestId(req);
   req.requestId = requestId;
   res.setHeader('X-Request-Id', requestId);
@@ -41,7 +51,7 @@ function requestLogger(req, res, next) {
   };
 
   const start = Date.now();
-  if (mode === 'json' || mode === 'true') {
+  if (mode === 'json') {
     console.log(
       '[REQ]',
       JSON.stringify({
@@ -57,7 +67,7 @@ function requestLogger(req, res, next) {
   res.on('finish', () => {
     const ms = Date.now() - start;
     const user = req.user ? { id: req.user.id, role: req.user.role, email: req.user.email } : null;
-    if (mode === 'json' || mode === 'true') {
+    if (mode === 'json') {
       console.log('[RES]', JSON.stringify({ id: requestId, status: res.statusCode, ms, user }));
       return;
     }
