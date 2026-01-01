@@ -46,3 +46,10 @@ For multi-instance production, replace with a shared store (Redis) so limits are
 
 ## Health check
 - `GET /healthz` returns `200` if DB is reachable, else `503`.
+
+## Seed data (attendance)
+To add mock `attendance_scans` rows (useful for UI testing) run locally against your Render DB:
+```bash
+DATABASE_URL="<Render external DATABASE_URL>?sslmode=require" \
+  npm run seed:attendance -- --email student@example.com --hostel-id 3 --days 30 --attendance-rate 0.7
+```
