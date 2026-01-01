@@ -21,6 +21,65 @@ function normalizeMeal(value) {
   return MEAL_TYPES.includes(normalized) ? normalized : null;
 }
 
+function parseTimeToMinutes(hhmm) {
+  const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return hh * 60 + mm;
+}
+
+function getNowISTMinutes() {
+  const parts = new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+  const m = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  const hh = Number(m.hour);
+  const mm = Number(m.minute);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  return hh * 60 + mm;
+}
+
+async function getHostelMealWindow({ hostelId, meal }) {
+  const result = await pool.query(
+    `SELECT meal,
+            to_char(start_time, 'HH24:MI') AS start_time,
+            to_char(end_time, 'HH24:MI') AS end_time,
+            grace_minutes
+     FROM hostel_meal_windows
+     WHERE hostel_id = $1 AND meal = $2
+     LIMIT 1`,
+    [hostelId, meal]
+  );
+  if (result.rows.length) {
+    const row = result.rows[0];
+    return {
+      meal: row.meal,
+      start_time: row.start_time,
+      end_time: row.end_time,
+      grace_minutes: Number(row.grace_minutes || 0) || 0,
+      source: 'db',
+    };
+  }
+  const fallback = DEFAULT_MEAL_WINDOWS.find(w => w.meal === meal);
+  if (!fallback) return null;
+  return { ...fallback, source: 'default' };
+}
+
+async function isMealWindowClosedForUpdates({ hostelId, meal, istNowMin }) {
+  const window = await getHostelMealWindow({ hostelId, meal });
+  if (!window) return false;
+  const endMin = parseTimeToMinutes(window.end_time);
+  if (endMin === null) return false;
+  const grace = Number(window.grace_minutes || 0) || 0;
+  return istNowMin !== null && istNowMin > endMin + grace;
+}
+
 async function getManagerHostelId({ userId, date }) {
   const result = await pool.query(
     `SELECT hostel_id
@@ -139,6 +198,14 @@ async function upsertDateOverride(req, res) {
     const gate = await requireManagerForHostel({ req, hostelId });
     if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
 
+    // Lock today's menu after the meal window ends (respect grace).
+    const today = getISTDateString();
+    if (String(date) === String(today)) {
+      const nowMin = getNowISTMinutes();
+      const closed = await isMealWindowClosedForUpdates({ hostelId, meal, istNowMin: nowMin });
+      if (closed) return res.status(403).json({ error: 'Meal window closed; menu locked' });
+    }
+
     const result = await pool.query(
       `INSERT INTO meal_calendars (hostel_id, date, meal, status, note, items)
        VALUES ($1, $2, $3, $4, $5, $6)
@@ -193,6 +260,16 @@ router.post('/template', authenticateToken, async (req, res) => {
     flowLog('MEALS TEMPLATE', 'Upsert request received', { hostel_id: hostelId, day_of_week: dayOfWeek, meal_type: meal });
     const gate = await requireManagerForHostel({ req, hostelId });
     if (!gate.ok) return res.status(gate.status).json({ error: gate.error });
+
+    // Lock today's weekly default after the meal window ends (respect grace).
+    const today = getISTDateString();
+    const todayDowRes = await pool.query('SELECT EXTRACT(DOW FROM $1::date)::int AS dow', [today]);
+    const todayDow = todayDowRes.rows?.[0]?.dow;
+    if (Number(todayDow) === Number(dayOfWeek)) {
+      const nowMin = getNowISTMinutes();
+      const closed = await isMealWindowClosedForUpdates({ hostelId, meal, istNowMin: nowMin });
+      if (closed) return res.status(403).json({ error: 'Meal window closed; menu locked' });
+    }
 
     const result = await pool.query(
       `INSERT INTO hostel_weekly_menus (hostel_id, day_of_week, meal, status, note, items)

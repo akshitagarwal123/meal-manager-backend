@@ -10,10 +10,89 @@ const { respondServerError } = require('../utils/http');
 const router = express.Router();
 
 const MEAL_TYPES = ['breakfast', 'lunch', 'snacks', 'dinner'];
+const DEFAULT_MEAL_WINDOWS = [
+  { meal: 'breakfast', start_time: '06:00', end_time: '09:00', grace_minutes: 0 },
+  { meal: 'lunch', start_time: '13:00', end_time: '15:00', grace_minutes: 0 },
+  { meal: 'snacks', start_time: '16:30', end_time: '18:00', grace_minutes: 0 },
+  { meal: 'dinner', start_time: '19:30', end_time: '21:30', grace_minutes: 0 },
+];
 
 function normalizeMeal(value) {
   const normalized = String(value || '').toLowerCase();
   return MEAL_TYPES.includes(normalized) ? normalized : null;
+}
+
+function parseTimeToMinutes(hhmm) {
+  const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return hh * 60 + mm;
+}
+
+function getNowISTMinutes() {
+  const parts = new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+  const m = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  const hh = Number(m.hour);
+  const mm = Number(m.minute);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  return hh * 60 + mm;
+}
+
+async function getHostelMealWindow({ hostelId, meal }) {
+  const result = await pool.query(
+    `SELECT meal,
+            to_char(start_time, 'HH24:MI') AS start_time,
+            to_char(end_time, 'HH24:MI') AS end_time,
+            grace_minutes
+     FROM hostel_meal_windows
+     WHERE hostel_id = $1 AND meal = $2
+     LIMIT 1`,
+    [hostelId, meal]
+  );
+  if (result.rows.length) {
+    const row = result.rows[0];
+    return {
+      meal: row.meal,
+      start_time: row.start_time,
+      end_time: row.end_time,
+      grace_minutes: Number(row.grace_minutes || 0) || 0,
+      source: 'db',
+    };
+  }
+  const fallback = DEFAULT_MEAL_WINDOWS.find(w => w.meal === meal);
+  if (!fallback) return null;
+  return { ...fallback, source: 'default' };
+}
+
+async function getEffectiveMealStatus({ hostelId, date, meal }) {
+  const override = await pool.query(
+    `SELECT status
+     FROM meal_calendars
+     WHERE hostel_id = $1 AND date = $2::date AND meal = $3
+     LIMIT 1`,
+    [hostelId, date, meal]
+  );
+  if (override.rows.length) return String(override.rows[0].status || 'open');
+
+  const template = await pool.query(
+    `SELECT status
+     FROM hostel_weekly_menus
+     WHERE hostel_id = $1
+       AND day_of_week = EXTRACT(DOW FROM $2::date)::int
+       AND meal = $3
+     LIMIT 1`,
+    [hostelId, date, meal]
+  );
+  if (template.rows.length) return String(template.rows[0].status || 'open');
+  return 'open';
 }
 
 async function getActiveManagerHostel({ userId, date }) {
@@ -172,15 +251,25 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
     );
     if (assignmentRes.rows.length === 0) return res.status(403).json({ error: 'Student not enrolled in this hostel' });
 
-    // Reject holiday for this meal today.
-    const mealRes = await pool.query(
-      `SELECT status
-       FROM meal_calendars
-       WHERE hostel_id = $1 AND date = $2 AND meal = $3
-       LIMIT 1`,
-      [managerHostelId, today, meal]
-    );
-    if (mealRes.rows?.[0]?.status === 'holiday') return res.status(409).json({ error: 'Meal is marked as holiday' });
+    // Enforce meal availability: override > weekly template > default open.
+    const effectiveStatus = await getEffectiveMealStatus({ hostelId: managerHostelId, date: today, meal });
+    if (String(effectiveStatus).toLowerCase() === 'holiday') {
+      return res.status(409).json({ message: 'Meal is marked as holiday' });
+    }
+
+    // Enforce meal window (IST) with grace_minutes.
+    const nowMin = getNowISTMinutes();
+    const window = await getHostelMealWindow({ hostelId: managerHostelId, meal });
+    if (nowMin !== null && window) {
+      const startMin = parseTimeToMinutes(window.start_time);
+      const endMin = parseTimeToMinutes(window.end_time);
+      const grace = Number(window.grace_minutes || 0) || 0;
+      if (startMin !== null && endMin !== null) {
+        if (nowMin < startMin || nowMin > endMin + grace) {
+          return res.status(409).json({ message: 'Meal window closed' });
+        }
+      }
+    }
 
     // Insert scan with dedupe constraint.
     try {
