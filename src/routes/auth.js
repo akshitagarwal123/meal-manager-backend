@@ -39,6 +39,8 @@ function signAppToken({ userRow, hostelId }) {
       role: userRow.role,
       college_id: userRow.college_id ?? null,
       hostel_id: hostelId ?? null,
+      // Used for single-device student login enforcement (see authenticateToken).
+      token_version: typeof userRow.token_version === 'number' ? userRow.token_version : undefined,
     },
     process.env.JWT_SECRET,
     { expiresIn: '7d' }
@@ -286,8 +288,21 @@ router.post('/verify-otp', limitVerifyOtp, async (req, res) => {
     const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
-    const userRow = userResult.rows[0];
+    let userRow = userResult.rows[0];
     if (userRow.is_active === false) return res.status(403).json({ error: 'User is inactive' });
+
+    // Single-device login for students: bump token_version so older JWTs become invalid.
+    if (userRow.role === 'student') {
+      const bumped = await pool.query(
+        `UPDATE users
+         SET token_version = token_version + 1
+         WHERE id = $1
+         RETURNING token_version`,
+        [userRow.id]
+      );
+      userRow = { ...userRow, token_version: Number(bumped.rows?.[0]?.token_version ?? 0) };
+    }
+
     const today = getISTDateString();
     const hostelId =
       userRow.role === 'manager'
