@@ -294,6 +294,30 @@ Attended/missed aggregated counts by meal type.
 }
 ```
 
+### `GET /meals/windows` (auth)
+Returns meal time windows for the requester’s active hostel (students: assigned hostel, managers: active hostel).
+
+**Query params (optional)**
+- `hostel_id` (number) — if provided, must match the requester’s active hostel.
+
+**Response 200**
+```json
+{
+  "hostel_id": 2,
+  "windows": [
+    { "meal": "breakfast", "start_time": "06:00", "end_time": "09:00", "grace_minutes": 0 },
+    { "meal": "lunch", "start_time": "13:00", "end_time": "15:00", "grace_minutes": 0 },
+    { "meal": "snacks", "start_time": "16:30", "end_time": "18:00", "grace_minutes": 0 },
+    { "meal": "dinner", "start_time": "19:30", "end_time": "21:30", "grace_minutes": 0 }
+  ]
+}
+```
+
+**Errors**
+- `401` `{"error":"Unauthorized"}`
+- `403` `{"error":"User not enrolled in any hostel"}`
+- `403` `{"error":"Forbidden"}`
+
 ### `GET /meals/template?hostel_id=1&day_of_week=1` (manager only)
 Weekly defaults (day_of_week: `0=Sun ... 6=Sat`).
 

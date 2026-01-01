@@ -317,11 +317,11 @@
 				}
 			]
 		},
-		{
-			"name": "Meals (Auth)",
-			"item": [
-				{
-					"name": "GET /meals/menu",
+			{
+				"name": "Meals (Auth)",
+				"item": [
+					{
+						"name": "GET /meals/menu",
 					"request": {
 						"method": "GET",
 						"header": [
@@ -350,11 +350,34 @@
 								}
 							]
 						}
+						},
+						"response": []
 					},
-					"response": []
-				}
-			]
-		},
+					{
+						"name": "GET /meals/windows",
+						"request": {
+							"method": "GET",
+							"header": [
+								{
+									"key": "Authorization",
+									"value": "Bearer {{studentToken}}"
+								}
+							],
+							"url": {
+								"raw": "{{baseUrl}}/meals/windows",
+								"host": [
+									"{{baseUrl}}"
+								],
+								"path": [
+									"meals",
+									"windows"
+								]
+							}
+						},
+						"response": []
+					}
+				]
+			},
 		{
 			"name": "Manager (Auth)",
 			"item": [

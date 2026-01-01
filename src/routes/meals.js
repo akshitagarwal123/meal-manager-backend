@@ -9,6 +9,12 @@ const { respondServerError } = require('../utils/http');
 const router = express.Router();
 
 const MEAL_TYPES = ['breakfast', 'lunch', 'snacks', 'dinner'];
+const DEFAULT_MEAL_WINDOWS = [
+  { meal: 'breakfast', start_time: '06:00', end_time: '09:00', grace_minutes: 0 },
+  { meal: 'lunch', start_time: '13:00', end_time: '15:00', grace_minutes: 0 },
+  { meal: 'snacks', start_time: '16:30', end_time: '18:00', grace_minutes: 0 },
+  { meal: 'dinner', start_time: '19:30', end_time: '21:30', grace_minutes: 0 },
+];
 
 function normalizeMeal(value) {
   const normalized = String(value || '').toLowerCase();
@@ -49,6 +55,73 @@ async function requireManagerForHostel({ req, hostelId }) {
   }
   return { ok: true, userId, assignedHostel };
 }
+
+async function getActiveStudentHostelId({ userId, date }) {
+  const result = await pool.query(
+    `SELECT hostel_id
+     FROM user_hostel_assignments
+     WHERE user_id = $1
+       AND start_date <= $2
+       AND (end_date IS NULL OR end_date >= $2)
+     ORDER BY start_date DESC
+     LIMIT 1`,
+    [userId, date]
+  );
+  return result.rows?.[0]?.hostel_id ?? null;
+}
+
+// Meal windows for a hostel.
+// GET /meals/windows?hostel_id=...
+// - Students: only their assigned hostel (hostel_id optional; if provided must match).
+// - Managers: only their active hostel (hostel_id optional; if provided must match).
+router.get('/windows', authenticateToken, async (req, res) => {
+  const requester = req.user;
+  if (!requester?.id) return res.status(401).json({ error: 'Unauthorized' });
+
+  const today = getISTDateString();
+  const requestedHostelIdRaw = req.query.hostel_id;
+  const requestedHostelId = requestedHostelIdRaw ? Number(requestedHostelIdRaw) : null;
+  if (requestedHostelIdRaw && !Number.isFinite(requestedHostelId)) return res.status(400).json({ error: 'hostel_id must be a number' });
+
+  try {
+    let hostelId = null;
+    if (requester.role === 'manager') {
+      hostelId = await getManagerHostelId({ userId: requester.id, date: today });
+    } else {
+      hostelId = await getActiveStudentHostelId({ userId: requester.id, date: today });
+    }
+    if (!hostelId) return res.status(403).json({ error: 'User not enrolled in any hostel' });
+
+    if (requestedHostelId && String(requestedHostelId) !== String(hostelId)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const result = await pool.query(
+      `SELECT meal, to_char(start_time, 'HH24:MI') AS start_time, to_char(end_time, 'HH24:MI') AS end_time, grace_minutes
+       FROM hostel_meal_windows
+       WHERE hostel_id = $1
+       ORDER BY meal ASC`,
+      [hostelId]
+    );
+
+    const windows = result.rows.length ? result.rows : DEFAULT_MEAL_WINDOWS;
+
+    await writeAuditLog({
+      collegeId: requester.college_id ?? null,
+      actorUserId: requester.id,
+      action: 'MEAL_WINDOWS_GET',
+      entityType: 'hostel',
+      entityId: String(hostelId),
+      details: { ...getReqMeta(req), count: windows.length, used_default: result.rows.length === 0 },
+    });
+
+    flowLog('MEAL WINDOWS', 'Returned', { hostel_id: hostelId, count: windows.length, used_default: result.rows.length === 0 });
+    return res.json({ hostel_id: Number(hostelId), windows });
+  } catch (err) {
+    flowLog('MEAL WINDOWS', 'Error', { error: err?.message || String(err) });
+    return respondServerError(res, req, 'Failed to fetch meal windows', err);
+  }
+});
 
 async function upsertDateOverride(req, res) {
   const hostelId = req.body?.hostel_id;
