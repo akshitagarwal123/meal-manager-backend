@@ -65,8 +65,11 @@ async function main() {
   const email = String(args.email || '').trim().toLowerCase();
   if (!email) throw new Error('--email is required');
 
-  const hostelId = args['hostel-id'] ? Number(args['hostel-id']) : null;
-  if (!hostelId || !Number.isFinite(hostelId)) throw new Error('--hostel-id is required (e.g. 3)');
+  const hostelIdArg = args['hostel-id'] ? Number(args['hostel-id']) : null;
+  const hostelCodeArg = args['hostel-code'] ? String(args['hostel-code']).trim() : null;
+  if ((!hostelIdArg || !Number.isFinite(hostelIdArg)) && !hostelCodeArg) {
+    throw new Error('--hostel-id or --hostel-code is required (e.g. --hostel-code AUROBINDO)');
+  }
 
   const days = args.days ? Number(args.days) : 30;
   if (!Number.isFinite(days) || days < 1 || days > 365) throw new Error('--days must be between 1 and 365');
@@ -82,10 +85,11 @@ async function main() {
   const endDateYmd = args.end ? String(args.end) : fmtISTYmd(new Date());
   if (!/^\d{4}-\d{2}-\d{2}$/.test(endDateYmd)) throw new Error('--end must be YYYY-MM-DD');
 
+  const backfillAssignment = String(args['backfill-assignment'] || '').toLowerCase();
+  const shouldBackfillAssignment = backfillAssignment === '1' || backfillAssignment === 'true' || backfillAssignment === 'yes';
+
   // Use a stable seed so reruns generate similar patterns; still safe due to ON CONFLICT DO NOTHING.
-  const seed = Math.abs(
-    Array.from(email + String(hostelId) + endDateYmd).reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) | 0, 7)
-  );
+  const seed = Math.abs(Array.from(email + String(hostelIdArg || hostelCodeArg) + endDateYmd).reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) | 0, 7));
   const rand = mulberry32(seed);
 
   const pool = getPoolFromEnv();
@@ -101,21 +105,56 @@ async function main() {
       scannedById = Number(mgrRes.rows[0].id);
     }
 
-    // Pre-check: does hostel exist?
-    const hostelRes = await pool.query('SELECT id, hostel_code, name FROM hostels WHERE id = $1 LIMIT 1', [hostelId]);
+    // Resolve hostel and validate.
+    const hostelRes = hostelIdArg
+      ? await pool.query('SELECT id, hostel_code, name FROM hostels WHERE id = $1 LIMIT 1', [hostelIdArg])
+      : await pool.query('SELECT id, hostel_code, name FROM hostels WHERE hostel_code = $1 LIMIT 1', [hostelCodeArg]);
     if (hostelRes.rows.length === 0) throw new Error(`Hostel not found for hostel_id=${hostelId}`);
+    const hostelId = Number(hostelRes.rows[0].id);
 
     // Build date list: endDateYmd back (days-1).
     // We generate by starting at midnight UTC and formatting into IST; it’s fine since we only care about YYYY-MM-DD.
     const endUtc = new Date(`${endDateYmd}T00:00:00.000Z`);
+    const startUtc = addDaysUTC(endUtc, -(days - 1));
+    const startDateYmd = fmtISTYmd(startUtc);
     const dates = [];
     for (let i = days - 1; i >= 0; i -= 1) {
       const d = addDaysUTC(endUtc, -i);
       dates.push(fmtISTYmd(d));
     }
 
+    // Optional: ensure the user is assigned to this hostel for the full range.
+    if (shouldBackfillAssignment) {
+      const activeAssignRes = await pool.query(
+        `SELECT id, start_date
+         FROM user_hostel_assignments
+         WHERE user_id = $1 AND hostel_id = $2 AND end_date IS NULL
+         ORDER BY start_date ASC
+         LIMIT 1`,
+        [userId, hostelId]
+      );
+
+      if (activeAssignRes.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO user_hostel_assignments (user_id, hostel_id, start_date, reason)
+           VALUES ($1, $2, $3::date, $4)
+           ON CONFLICT DO NOTHING`,
+          [userId, hostelId, startDateYmd, 'seedAttendance backfill']
+        );
+      } else {
+        const currentStart = String(activeAssignRes.rows[0].start_date);
+        if (currentStart > startDateYmd) {
+          await pool.query(`UPDATE user_hostel_assignments SET start_date = $1::date WHERE id = $2`, [
+            startDateYmd,
+            activeAssignRes.rows[0].id,
+          ]);
+        }
+      }
+    }
+
     let inserted = 0;
     let skippedNotAssigned = 0;
+    let skippedNotEligible = 0;
 
     for (const dateYmd of dates) {
       // Only insert if user is assigned to this hostel on that date.
@@ -134,8 +173,30 @@ async function main() {
         continue;
       }
 
+      // Only insert scans for meals that are eligible/open on that day.
+      const statusRes = await pool.query(
+        `WITH meal_types AS (
+           SELECT * FROM (VALUES ('breakfast'::text), ('lunch'::text), ('snacks'::text), ('dinner'::text)) AS t(meal)
+         )
+         SELECT mt.meal,
+                COALESCE(mc.status, twm.status, 'open') AS status
+         FROM meal_types mt
+         LEFT JOIN meal_calendars mc
+           ON mc.hostel_id = $1 AND mc.date = $2::date AND mc.meal = mt.meal
+         LEFT JOIN hostel_weekly_menus twm
+           ON twm.hostel_id = $1
+          AND twm.day_of_week = EXTRACT(DOW FROM $2::date)::int
+          AND twm.meal = mt.meal`,
+        [hostelId, dateYmd]
+      );
+      const statusByMeal = Object.fromEntries(statusRes.rows.map(r => [r.meal, r.status]));
+
       const rows = [];
       for (const meal of MEAL_TYPES) {
+        if (String(statusByMeal[meal] || 'open') !== 'open') {
+          skippedNotEligible += 1;
+          continue;
+        }
         if (rand() > attendanceRate) continue;
         rows.push({ date: dateYmd, meal });
       }
@@ -164,12 +225,16 @@ async function main() {
           ok: true,
           user: { email, id: String(userId) },
           hostel_id: String(hostelId),
+          hostel_code: hostelRes.rows[0].hostel_code,
           end: endDateYmd,
+          start: startDateYmd,
           days,
           attendance_rate: attendanceRate,
           source,
           inserted_rows: inserted,
           skipped_days_not_assigned: skippedNotAssigned,
+          skipped_meals_not_eligible: skippedNotEligible,
+          backfill_assignment: shouldBackfillAssignment,
         },
         null,
         2
@@ -184,4 +249,3 @@ main().catch(err => {
   console.error('seedAttendance error:', err?.message || String(err));
   process.exit(1);
 });
-
