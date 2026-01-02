@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const express = require('express');
+const crypto = require('crypto');
 const pool = require('../config/db');
 const mailer = require('../config/email');
 const { getISTDateString } = require('../utils/date');
@@ -30,6 +31,20 @@ function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
+function isProduction() {
+  return process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'prod';
+}
+
+function shouldReturnDevOtp() {
+  return !isProduction() && process.env.RETURN_DEV_OTP === 'true';
+}
+
+function hashOtp({ email, otp }) {
+  const secret = process.env.OTP_HASH_SECRET || process.env.JWT_SECRET;
+  if (!secret) throw new Error('OTP hash secret missing (set OTP_HASH_SECRET or JWT_SECRET)');
+  return crypto.createHmac('sha256', secret).update(`${String(email).toLowerCase()}:${String(otp)}`).digest('hex');
+}
+
 function signAppToken({ userRow, hostelId }) {
   return jwt.sign(
     {
@@ -51,7 +66,7 @@ async function saveOtpToAuditLog({ email, otp, expiresAt }) {
   await pool.query(
     `INSERT INTO audit_logs (college_id, actor_user_id, action, entity_type, entity_id, details)
      VALUES (NULL, NULL, $1, $2, $3, $4::jsonb)`,
-    ['OTP_GENERATED', 'login_otp', email, JSON.stringify({ otp, expires_at: expiresAt.toISOString() })]
+    ['OTP_GENERATED', 'login_otp', email, JSON.stringify({ otp_hash: hashOtp({ email, otp }), expires_at: expiresAt.toISOString() })]
   );
 }
 
@@ -67,9 +82,19 @@ async function verifyOtpFromAuditLog({ email, otp }) {
   if (result.rows.length === 0) return { ok: false, reason: 'not_found' };
 
   const details = result.rows[0].details || {};
+  const storedOtpHash = String(details.otp_hash || '');
   const storedOtp = String(details.otp || '');
   const expiresAt = details.expires_at ? new Date(details.expires_at) : null;
-  if (!storedOtp || storedOtp !== String(otp)) return { ok: false, reason: 'mismatch' };
+  if (storedOtpHash) {
+    const incomingHash = hashOtp({ email, otp });
+    if (storedOtpHash.length !== incomingHash.length) return { ok: false, reason: 'mismatch' };
+    const a = Buffer.from(storedOtpHash, 'hex');
+    const b = Buffer.from(incomingHash, 'hex');
+    if (a.length !== b.length || a.length === 0) return { ok: false, reason: 'mismatch' };
+    if (!crypto.timingSafeEqual(a, b)) return { ok: false, reason: 'mismatch' };
+  } else {
+    if (!storedOtp || storedOtp !== String(otp)) return { ok: false, reason: 'mismatch' };
+  }
   if (!expiresAt || Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() < Date.now()) return { ok: false, reason: 'expired' };
 
   await pool.query(
@@ -229,6 +254,7 @@ router.post('/send-otp', limitSendOtp, async (req, res) => {
     req.log?.info('auth.send_otp.email_sent', { email });
     req.setLogSummary?.('OTP generated and email sent', { email });
     const responseBody = { success: true, message: 'OTP sent to email' };
+    if (shouldReturnDevOtp()) responseBody.dev_otp = otp;
     flowLog('SEND OTP', 'Response', { success: responseBody.success, message: responseBody.message });
     return res.json(responseBody);
   } catch (err) {
@@ -243,9 +269,7 @@ router.post('/send-otp', limitSendOtp, async (req, res) => {
       details: { ...getReqMeta(req), error: details },
     });
 
-    const allowFallback =
-      process.env.ALLOW_DEV_OTP === 'true' ||
-      (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'prod');
+    const allowFallback = !isProduction() && (process.env.ALLOW_DEV_OTP === 'true' || process.env.NODE_ENV !== 'prod');
 
     if (allowFallback) {
       return res.json({
