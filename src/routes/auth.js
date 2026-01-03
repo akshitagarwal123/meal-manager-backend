@@ -39,6 +39,13 @@ function shouldReturnDevOtp() {
   return !isProduction() && process.env.RETURN_DEV_OTP === 'true';
 }
 
+const TEST_OTP = '123456';
+const TEST_OTP_ALLOWLIST = new Set(['akshitagarwal431@gmail.com', 'akshitagarwal10505@gmail.com']);
+
+function isTestOtpEnabled() {
+  return !isProduction() && process.env.ENABLE_TEST_OTP === 'true';
+}
+
 function hashOtp({ email, otp }) {
   const secret = process.env.OTP_HASH_SECRET || process.env.JWT_SECRET;
   if (!secret) throw new Error('OTP hash secret missing (set OTP_HASH_SECRET or JWT_SECRET)');
@@ -183,66 +190,83 @@ router.post('/send-otp', limitSendOtp, async (req, res) => {
     return res.status(400).json({ error: 'Invalid email' });
   }
 
-  flowLog('SEND OTP', 'Request received', { email });
-  req.log?.info('auth.send_otp.start', { email });
+  const emailNorm = String(email).trim().toLowerCase();
+  flowLog('SEND OTP', 'Request received', { email: emailNorm });
+  req.log?.info('auth.send_otp.start', { email: emailNorm });
   const otp = generateOTP();
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
   try {
     // Only allow OTP for users that already exist in DB.
-    const userRes = await pool.query('SELECT id, is_active, college_id FROM users WHERE email = $1 LIMIT 1', [email]);
+    const userRes = await pool.query('SELECT id, is_active, college_id FROM users WHERE email = $1 LIMIT 1', [emailNorm]);
     if (userRes.rows.length === 0) {
-      flowLog('SEND OTP', 'User not found', { email });
-      req.log?.info('auth.send_otp.rejected', { email, reason: 'user_not_found' });
+      flowLog('SEND OTP', 'User not found', { email: emailNorm });
+      req.log?.info('auth.send_otp.rejected', { email: emailNorm, reason: 'user_not_found' });
       await writeAuditLog({
         action: 'AUTH_SEND_OTP_REJECTED',
         entityType: 'login_otp',
-        entityId: email,
+        entityId: emailNorm,
         details: { ...getReqMeta(req), reason: 'user_not_found' },
       });
-      req.setLogSummary?.('OTP request rejected (user not found)', { email });
+      req.setLogSummary?.('OTP request rejected (user not found)', { email: emailNorm });
       return res.status(404).json({ error: 'User not found' });
     }
     if (userRes.rows[0].is_active === false) {
-      flowLog('SEND OTP', 'User inactive', { email });
-      req.log?.info('auth.send_otp.rejected', { email, reason: 'user_inactive' });
+      flowLog('SEND OTP', 'User inactive', { email: emailNorm });
+      req.log?.info('auth.send_otp.rejected', { email: emailNorm, reason: 'user_inactive' });
       await writeAuditLog({
         collegeId: userRes.rows[0].college_id ?? null,
         actorUserId: userRes.rows[0].id,
         action: 'AUTH_SEND_OTP_REJECTED',
         entityType: 'login_otp',
-        entityId: email,
+        entityId: emailNorm,
         details: { ...getReqMeta(req), reason: 'user_inactive' },
       });
-      req.setLogSummary?.('OTP request rejected (user inactive)', { email });
+      req.setLogSummary?.('OTP request rejected (user inactive)', { email: emailNorm });
       return res.status(403).json({ error: 'User is inactive' });
     }
     const actorUserId = userRes.rows[0].id;
     const collegeId = userRes.rows[0].college_id ?? null;
 
-    await saveOtpToAuditLog({ email, otp, expiresAt });
-    flowLog('SEND OTP', 'OTP stored in DB', { email, otp: mask(otp) });
+    // Optional: in non-prod QA mode for allowlisted emails, skip sending email (frontend can use fixed OTP).
+    if (isTestOtpEnabled() && TEST_OTP_ALLOWLIST.has(emailNorm)) {
+      flowLog('SEND OTP', 'Test OTP mode: skipping email send', { email: emailNorm });
+      req.log?.info('auth.send_otp.test_otp_skip', { email: emailNorm });
+      req.setLogSummary?.('OTP skipped (test OTP enabled)', { email: emailNorm });
+      await writeAuditLog({
+        collegeId,
+        actorUserId,
+        action: 'AUTH_SEND_OTP_TEST_BYPASS',
+        entityType: 'login_otp',
+        entityId: emailNorm,
+        details: { ...getReqMeta(req), reason: 'test_otp_enabled' },
+      });
+      return res.json({ success: true, message: 'OTP sent to email' });
+    }
+
+    await saveOtpToAuditLog({ email: emailNorm, otp, expiresAt });
+    flowLog('SEND OTP', 'OTP stored in DB', { email: emailNorm, otp: mask(otp) });
     await writeAuditLog({
       collegeId,
       actorUserId,
       action: 'AUTH_SEND_OTP',
       entityType: 'login_otp',
-      entityId: email,
+      entityId: emailNorm,
       details: { ...getReqMeta(req), expires_at: expiresAt.toISOString() },
     });
-    req.log?.info('auth.send_otp.audit_saved', { email, actor_user_id: actorUserId, expires_at: expiresAt.toISOString() });
+    req.log?.info('auth.send_otp.audit_saved', { email: emailNorm, actor_user_id: actorUserId, expires_at: expiresAt.toISOString() });
 
     const provider = process.env.BREVO_API_KEY ? 'brevo_api' : process.env.EMAIL_HOST ? 'smtp' : 'gmail';
     flowLog('SEND OTP', 'Email provider selected', { provider });
-    req.log?.info('auth.send_otp.email_provider', { email, provider });
+    req.log?.info('auth.send_otp.email_provider', { email: emailNorm, provider });
 
     const mailPromise = mailer.sendMail({
       from: process.env.EMAIL_FROM || process.env.EMAIL_USER,
-      to: email,
+      to: emailNorm,
       subject: 'Your OTP for Count Wise',
       text: `Your OTP is ${otp}. It is valid for 5 minutes.`,
     });
-    req.log?.info('auth.send_otp.email_sending', { email });
+    req.log?.info('auth.send_otp.email_sending', { email: emailNorm });
 
     const timeoutMs = Number(process.env.OTP_EMAIL_TIMEOUT_MS || 15000);
     await Promise.race([
@@ -250,22 +274,22 @@ router.post('/send-otp', limitSendOtp, async (req, res) => {
       new Promise((_, reject) => setTimeout(() => reject(new Error('OTP email timeout')), timeoutMs)),
     ]);
 
-    flowLog('SEND OTP', 'Email sent', { email });
-    req.log?.info('auth.send_otp.email_sent', { email });
-    req.setLogSummary?.('OTP generated and email sent', { email });
+    flowLog('SEND OTP', 'Email sent', { email: emailNorm });
+    req.log?.info('auth.send_otp.email_sent', { email: emailNorm });
+    req.setLogSummary?.('OTP generated and email sent', { email: emailNorm });
     const responseBody = { success: true, message: 'OTP sent to email' };
     if (shouldReturnDevOtp()) responseBody.dev_otp = otp;
     flowLog('SEND OTP', 'Response', { success: responseBody.success, message: responseBody.message });
     return res.json(responseBody);
   } catch (err) {
     const details = err?.message || String(err);
-    flowLog('SEND OTP', 'Failed', { email, error: details });
-    req.log?.warn('auth.send_otp.error', { email, error: details });
-    req.setLogSummary?.('OTP send failed', { email });
+    flowLog('SEND OTP', 'Failed', { email: emailNorm, error: details });
+    req.log?.warn('auth.send_otp.error', { email: emailNorm, error: details });
+    req.setLogSummary?.('OTP send failed', { email: emailNorm });
     await writeAuditLog({
       action: 'AUTH_SEND_OTP_ERROR',
       entityType: 'login_otp',
-      entityId: email,
+      entityId: emailNorm,
       details: { ...getReqMeta(req), error: details },
     });
 
@@ -291,25 +315,44 @@ router.post('/verify-otp', limitVerifyOtp, async (req, res) => {
   const otp = req.body?.otp;
   if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
 
+  const emailNorm = String(email).trim().toLowerCase();
+  const otpNorm = String(otp).trim();
+
   try {
-    flowLog('VERIFY OTP', 'Request received', { email, otp: mask(otp) });
-    req.log?.info('auth.verify_otp.start', { email });
-    const verified = await verifyOtpFromAuditLog({ email, otp });
-    if (!verified.ok) {
-      flowLog('VERIFY OTP', 'OTP invalid or expired', { email, reason: verified.reason });
-      req.log?.info('auth.verify_otp.failed', { email, reason: verified.reason });
-      req.setLogSummary?.('OTP verification failed', { email, reason: verified.reason });
+    flowLog('VERIFY OTP', 'Request received', { email: emailNorm, otp: mask(otpNorm) });
+    req.log?.info('auth.verify_otp.start', { email: emailNorm });
+
+    const isTestOtp =
+      isTestOtpEnabled() && TEST_OTP_ALLOWLIST.has(emailNorm) && otpNorm === TEST_OTP;
+
+    if (isTestOtp) {
+      flowLog('VERIFY OTP', 'Test OTP accepted', { email: emailNorm });
+      req.log?.info('auth.verify_otp.test_otp', { email: emailNorm });
+      req.setLogSummary?.('OTP verified (test OTP)', { email: emailNorm });
       await writeAuditLog({
-        action: 'AUTH_VERIFY_OTP_FAILED',
+        action: 'AUTH_VERIFY_OTP_TEST_BYPASS',
         entityType: 'login_otp',
-        entityId: email,
-        details: { ...getReqMeta(req), reason: verified.reason },
+        entityId: emailNorm,
+        details: { ...getReqMeta(req), reason: 'test_otp_enabled' },
       });
-      return res.status(401).json({ error: 'Invalid or expired OTP' });
+    } else {
+      const verified = await verifyOtpFromAuditLog({ email: emailNorm, otp: otpNorm });
+      if (!verified.ok) {
+        flowLog('VERIFY OTP', 'OTP invalid or expired', { email: emailNorm, reason: verified.reason });
+        req.log?.info('auth.verify_otp.failed', { email: emailNorm, reason: verified.reason });
+        req.setLogSummary?.('OTP verification failed', { email: emailNorm, reason: verified.reason });
+        await writeAuditLog({
+          action: 'AUTH_VERIFY_OTP_FAILED',
+          entityType: 'login_otp',
+          entityId: emailNorm,
+          details: { ...getReqMeta(req), reason: verified.reason },
+        });
+        return res.status(401).json({ error: 'Invalid or expired OTP' });
+      }
     }
 
-    flowLog('VERIFY OTP', 'OTP valid', { email });
-    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    flowLog('VERIFY OTP', 'OTP valid', { email: emailNorm });
+    const userResult = await pool.query('SELECT * FROM users WHERE email = $1', [emailNorm]);
     if (userResult.rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
     let userRow = userResult.rows[0];
@@ -334,9 +377,9 @@ router.post('/verify-otp', limitVerifyOtp, async (req, res) => {
         : await getActiveHostelAssignment({ userId: userRow.id, date: today });
 
     const token = signAppToken({ userRow, hostelId });
-    flowLog('VERIFY OTP', 'JWT issued', { email, token: mask(token) });
-    req.log?.info('auth.verify_otp.success', { email, user_id: userRow.id, role: userRow.role, hostel_id: hostelId ?? null });
-    req.setLogSummary?.('OTP verified; token issued', { email, user_id: userRow.id, role: userRow.role });
+    flowLog('VERIFY OTP', 'JWT issued', { email: emailNorm, token: mask(token) });
+    req.log?.info('auth.verify_otp.success', { email: emailNorm, user_id: userRow.id, role: userRow.role, hostel_id: hostelId ?? null });
+    req.setLogSummary?.('OTP verified; token issued', { email: emailNorm, user_id: userRow.id, role: userRow.role });
     await writeAuditLog({
       collegeId: userRow.college_id ?? null,
       actorUserId: userRow.id,
@@ -349,13 +392,13 @@ router.post('/verify-otp', limitVerifyOtp, async (req, res) => {
     flowLog('VERIFY OTP', 'Response', { success: responseBody.success, message: responseBody.message });
     return res.json(responseBody);
   } catch (err) {
-    flowLog('VERIFY OTP', 'Error', { email, error: err?.message || String(err) });
-    req.log?.error('auth.verify_otp.error', { email, error: err?.message || String(err) });
-    req.setLogSummary?.('OTP verification error', { email });
+    flowLog('VERIFY OTP', 'Error', { email: emailNorm, error: err?.message || String(err) });
+    req.log?.error('auth.verify_otp.error', { email: emailNorm, error: err?.message || String(err) });
+    req.setLogSummary?.('OTP verification error', { email: emailNorm });
     await writeAuditLog({
       action: 'AUTH_VERIFY_OTP_ERROR',
       entityType: 'login_otp',
-      entityId: email,
+      entityId: emailNorm,
       details: { ...getReqMeta(req), error: err?.message || String(err) },
     });
     return respondServerError(res, req, 'Failed to verify OTP', err);
