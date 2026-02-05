@@ -271,16 +271,59 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
       }
     }
 
-    // Insert scan with dedupe constraint.
-    try {
-      await pool.query(
-        `INSERT INTO attendance_scans (user_id, hostel_id, date, meal, scanned_by, source)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [student.id, managerHostelId, today, meal, managerId, req.body?.source ?? 'qr']
+    // Insert scan with dedupe handling. On duplicates return structured details for UI warning popup.
+    const insertRes = await pool.query(
+      `INSERT INTO attendance_scans (user_id, hostel_id, date, meal, scanned_by, source)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (hostel_id, date, meal, user_id) DO NOTHING
+       RETURNING scanned_at`,
+      [student.id, managerHostelId, today, meal, managerId, req.body?.source ?? 'qr']
+    );
+    if ((insertRes.rowCount || 0) === 0) {
+      const existingRes = await pool.query(
+        `SELECT scanned_at
+         FROM attendance_scans
+         WHERE user_id = $1 AND hostel_id = $2 AND date = $3 AND meal = $4
+         ORDER BY scanned_at DESC
+         LIMIT 1`,
+        [student.id, managerHostelId, today, meal]
       );
-    } catch (e) {
-      if (e && e.code === '23505') return res.status(409).json({ message: 'Attendance already marked' });
-      throw e;
+      const markedAt = existingRes.rows?.[0]?.scanned_at ? new Date(existingRes.rows[0].scanned_at).toISOString() : null;
+      req.log?.warn('admin.mark_attendance.duplicate', {
+        manager_id: managerId,
+        student_id: student.id,
+        student_email: student.email ?? null,
+        student_name: student.name ?? null,
+        hostel_id: managerHostelId,
+        date: today,
+        meal,
+        marked_at: markedAt,
+      });
+      flowLog('ATTENDANCE', 'Already marked', { student_email: student.email ?? null, student_name: student.name ?? null, meal_type: meal, date: today });
+      req.setLogSummary?.(`attendance already marked for ${student.email} (${meal})`, { student_id: student.id, meal });
+      await writeAuditLog({
+        collegeId: req.user?.college_id ?? null,
+        actorUserId: managerId,
+        action: 'ATTENDANCE_ALREADY_MARKED',
+        entityType: 'attendance_scan',
+        entityId: `${managerHostelId}:${today}:${meal}:${student.id}`,
+        details: {
+          ...getReqMeta(req),
+          student_id: student.id,
+          student_email: student.email ?? null,
+          student_name: student.name ?? null,
+          marked_at: markedAt,
+        },
+      });
+      return res.status(409).json({
+        success: false,
+        code: 'ATTENDANCE_ALREADY_MARKED',
+        message: 'Attendance already marked',
+        student_name: student.name ?? null,
+        student_email: student.email ?? null,
+        meal_type: meal,
+        marked_at: markedAt,
+      });
     }
 
     req.log?.info('admin.mark_attendance.success', { manager_id: managerId, student_id: student.id, hostel_id: managerHostelId, date: today, meal });
