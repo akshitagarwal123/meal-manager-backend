@@ -294,6 +294,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
         student_id: student.id,
         student_email: student.email ?? null,
         student_name: student.name ?? null,
+        student_roll_no: student.roll_no ?? null,
         hostel_id: managerHostelId,
         date: today,
         meal,
@@ -312,6 +313,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
           student_id: student.id,
           student_email: student.email ?? null,
           student_name: student.name ?? null,
+          student_roll_no: student.roll_no ?? null,
           marked_at: markedAt,
         },
       });
@@ -320,6 +322,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
         code: 'ATTENDANCE_ALREADY_MARKED',
         message: 'Attendance already marked',
         student_name: student.name ?? null,
+        student_roll_no: student.roll_no ?? null,
         student_email: student.email ?? null,
         meal_type: meal,
         marked_at: markedAt,
