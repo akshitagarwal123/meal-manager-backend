@@ -6,6 +6,7 @@ const { getISTDateString } = require('../utils/date');
 const { writeAuditLog, getReqMeta } = require('../utils/audit');
 const { flowLog, mask } = require('../utils/flowLog');
 const { respondServerError } = require('../utils/http');
+const { normalizePasscode, generateShortCode, getCandidateSteps } = require('../utils/shortCode');
 
 const router = express.Router();
 
@@ -194,40 +195,71 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
     if (!managerHostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
 
     const qrToken = req.body?.qr_token ?? req.body?.qrToken ?? null;
+    const passcode = normalizePasscode(req.body?.passcode);
     const meal = normalizeMeal(req.body?.meal_type ?? req.body?.meal);
-    if (!qrToken || typeof qrToken !== 'string') {
+    if ((!qrToken || typeof qrToken !== 'string') && !passcode) {
       if (req.body?.email) {
         return res.status(400).json({ error: 'qr_token is required (email-based attendance is removed)' });
       }
-      return res.status(400).json({ error: 'qr_token is required' });
+      return res.status(400).json({ error: 'qr_token or 6-digit passcode is required' });
     }
+    if (req.body?.passcode && !passcode) return res.status(400).json({ error: 'passcode must be exactly 6 digits' });
     if (!meal) return res.status(400).json({ error: 'meal_type must be breakfast, lunch, snacks, or dinner' });
 
-    flowLog('ATTENDANCE', 'Mark request received', { manager_email: req.user?.email, meal_type: meal, qr_token: qrToken });
-    req.log?.info('admin.mark_attendance.start', { manager_id: managerId, hostel_id: managerHostelId, date: today, meal });
+    const mode = qrToken && typeof qrToken === 'string' ? 'qr' : 'code';
+    flowLog('ATTENDANCE', 'Mark request received', { manager_email: req.user?.email, meal_type: meal, mode, qr_token: qrToken ? '[present]' : undefined, passcode: passcode ? '[present]' : undefined });
+    req.log?.info('admin.mark_attendance.start', { manager_id: managerId, hostel_id: managerHostelId, date: today, meal, mode });
 
-    // Determine student identity from the scanned QR token.
+    // Determine student identity from scanned QR token or short passcode.
     let studentIdFromToken = null;
     let hostelFromToken = null;
 
     const tokenSecret = process.env.QR_TOKEN_SECRET || process.env.JWT_SECRET;
+    const ttlSeconds = Number(process.env.QR_TOKEN_TTL_SECONDS || 30);
     const leewaySeconds = Number(process.env.QR_TOKEN_LEEWAY_SECONDS || 10);
     if (!tokenSecret) return respondServerError(res, req, 'Server error', new Error('QR_TOKEN_SECRET/JWT_SECRET not set'));
 
-    try {
-      const decoded = jwt.verify(qrToken, tokenSecret, { clockTolerance: leewaySeconds });
-      if (decoded?.typ !== 'qr') return res.status(400).json({ error: 'Invalid qr_token' });
-      studentIdFromToken = decoded.user_id ?? decoded.id ?? null;
-      hostelFromToken = decoded.hostel_id ?? null;
-    } catch (e) {
-      return res.status(400).json({ error: 'Invalid or expired qr_token' });
+    if (mode === 'qr') {
+      try {
+        const decoded = jwt.verify(qrToken, tokenSecret, { clockTolerance: leewaySeconds });
+        if (decoded?.typ !== 'qr') return res.status(400).json({ error: 'Invalid qr_token' });
+        studentIdFromToken = decoded.user_id ?? decoded.id ?? null;
+        hostelFromToken = decoded.hostel_id ?? null;
+      } catch (e) {
+        return res.status(400).json({ error: 'Invalid or expired qr_token' });
+      }
+    } else {
+      const activeStudentsRes = await pool.query(
+        `SELECT u.id
+         FROM users u
+         INNER JOIN user_hostel_assignments a
+           ON a.user_id = u.id
+          AND a.hostel_id = $1
+          AND a.start_date <= $2
+          AND (a.end_date IS NULL OR a.end_date >= $2)`,
+        [managerHostelId, today]
+      );
+      const steps = getCandidateSteps({ ttlSeconds, leewaySeconds });
+      const matchedIds = [];
+      for (const row of activeStudentsRes.rows) {
+        for (const step of steps) {
+          if (generateShortCode({ userId: row.id, secret: tokenSecret, step }) === passcode) {
+            matchedIds.push(row.id);
+            break;
+          }
+        }
+      }
+      if (matchedIds.length === 0) return res.status(400).json({ error: 'Invalid or expired passcode' });
+      if (matchedIds.length > 1) return res.status(409).json({ error: 'Passcode collision. Please scan QR.' });
+      studentIdFromToken = Number(matchedIds[0]);
+      hostelFromToken = managerHostelId;
     }
 
     if (studentIdFromToken === null || studentIdFromToken === undefined) {
-      return res.status(400).json({ error: 'Invalid qr_token' });
+      return res.status(400).json({ error: mode === 'qr' ? 'Invalid qr_token' : 'Invalid passcode' });
     }
 
-    flowLog('ATTENDANCE', 'QR token verified', { student_id: studentIdFromToken, hostel_id: hostelFromToken ?? '' });
+    flowLog('ATTENDANCE', mode === 'qr' ? 'QR token verified' : 'Passcode verified', { student_id: studentIdFromToken, hostel_id: hostelFromToken ?? '' });
 
     // Safety check: token hostel should match manager hostel (prevents cross-hostel scans).
     if (hostelFromToken && String(hostelFromToken) !== String(managerHostelId)) {
@@ -277,7 +309,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (hostel_id, date, meal, user_id) DO NOTHING
        RETURNING scanned_at`,
-      [student.id, managerHostelId, today, meal, managerId, req.body?.source ?? 'qr']
+      [student.id, managerHostelId, today, meal, managerId, req.body?.source ?? mode]
     );
     if ((insertRes.rowCount || 0) === 0) {
       const existingRes = await pool.query(
@@ -338,7 +370,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
       action: 'ATTENDANCE_MARKED',
       entityType: 'attendance_scan',
       entityId: `${managerHostelId}:${today}:${meal}:${student.id}`,
-      details: { ...getReqMeta(req), student_id: student.id, student_email: student.email, source: req.body?.source ?? 'qr' },
+      details: { ...getReqMeta(req), student_id: student.id, student_email: student.email, source: req.body?.source ?? mode },
     });
     return res.json({ message: 'Attendance marked' });
   } catch (err) {

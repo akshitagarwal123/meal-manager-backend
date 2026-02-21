@@ -6,6 +6,7 @@ const { getISTDateString } = require('../utils/date');
 const { writeAuditLog, getReqMeta } = require('../utils/audit');
 const { flowLog, mask } = require('../utils/flowLog');
 const { respondServerError } = require('../utils/http');
+const { getTimeStep, generateShortCode } = require('../utils/shortCode');
 
 const router = express.Router();
 
@@ -377,8 +378,13 @@ router.get('/qrcode', authenticateToken, async (req, res) => {
       tokenSecret,
       { expiresIn: ttlSeconds }
     );
+    const shortCode = generateShortCode({
+      userId,
+      secret: tokenSecret,
+      step: getTimeStep(ttlSeconds),
+    });
 
-    const payload = { qr_token: qrToken };
+    const payload = { qr_token: qrToken, short_code: shortCode };
     const qr = await QRCode.toDataURL(JSON.stringify(payload));
     await writeAuditLog({
       collegeId: req.user?.college_id ?? null,
@@ -389,7 +395,7 @@ router.get('/qrcode', authenticateToken, async (req, res) => {
       details: { ...getReqMeta(req), hostel_id: hostelId ?? null },
     });
     flowLog('QRCODE', 'Generated', { email, hostel_id: hostelId ?? '', ttl_seconds: String(ttlSeconds) });
-    return res.json({ qr, payload, expires_in_seconds: ttlSeconds });
+    return res.json({ qr, payload, short_code: shortCode, expires_in_seconds: ttlSeconds });
   } catch (err) {
     flowLog('QRCODE', 'Error', { email, error: err?.message || String(err) });
     await writeAuditLog({
