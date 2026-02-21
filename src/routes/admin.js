@@ -220,7 +220,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
       studentIdFromToken = decoded.user_id ?? decoded.id ?? null;
       hostelFromToken = decoded.hostel_id ?? null;
     } catch (e) {
-      return res.status(401).json({ error: 'Invalid or expired qr_token' });
+      return res.status(400).json({ error: 'Invalid or expired qr_token' });
     }
 
     if (studentIdFromToken === null || studentIdFromToken === undefined) {
