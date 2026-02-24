@@ -110,6 +110,47 @@ async function getActiveManagerHostel({ userId, date }) {
   return result.rows?.[0]?.hostel_id ?? null;
 }
 
+async function getManagerScope({ userId, date }) {
+  const baseRes = await pool.query(
+    `SELECT hs.hostel_id, h.mess_no
+     FROM hostel_staff hs
+     JOIN hostels h ON h.id = hs.hostel_id
+     WHERE hs.user_id = $1
+       AND hs.start_date <= $2
+       AND (hs.end_date IS NULL OR hs.end_date >= $2)
+     ORDER BY hs.start_date DESC
+     LIMIT 1`,
+    [userId, date]
+  );
+  const primaryHostelId = baseRes.rows?.[0]?.hostel_id ?? null;
+  const messNo = baseRes.rows?.[0]?.mess_no ?? null;
+  if (!primaryHostelId) return { primaryHostelId: null, messNo: null, accessibleHostelIds: [] };
+
+  // If a mess number exists, manager can operate across all hostels in same mess.
+  if (messNo) {
+    const scopeRes = await pool.query(
+      `SELECT hs.hostel_id
+       FROM hostel_staff hs
+       JOIN hostels h ON h.id = hs.hostel_id
+       WHERE hs.user_id = $1
+         AND hs.start_date <= $2
+         AND (hs.end_date IS NULL OR hs.end_date >= $2)
+         AND h.mess_no = $3`,
+      [userId, date, messNo]
+    );
+    const accessibleHostelIds = Array.from(new Set(scopeRes.rows.map(r => Number(r.hostel_id)))).filter(Number.isFinite);
+    return { primaryHostelId, messNo, accessibleHostelIds };
+  }
+
+  return { primaryHostelId, messNo, accessibleHostelIds: [Number(primaryHostelId)] };
+}
+
+function parseRequestedHostelId(raw, fallbackHostelId) {
+  if (raw === undefined || raw === null || raw === '') return Number(fallbackHostelId);
+  const id = Number(raw);
+  return Number.isFinite(id) ? id : null;
+}
+
 function signManagerToken({ userRow, hostelId }) {
   return jwt.sign(
     {
@@ -156,7 +197,8 @@ router.post('/login', async (req, res) => {
     const userRow = userRes.rows[0];
 
     const today = getISTDateString();
-    const hostelId = await getActiveManagerHostel({ userId: userRow.id, date: today });
+    const scope = await getManagerScope({ userId: userRow.id, date: today });
+    const hostelId = scope.primaryHostelId;
     if (!hostelId) return res.status(403).json({ error: 'Manager not assigned to any hostel' });
 
     const token = signManagerToken({ userRow, hostelId });
@@ -169,7 +211,7 @@ router.post('/login', async (req, res) => {
       entityId: userRow.id,
       details: { ...getReqMeta(req), hostel_id: hostelId },
     });
-    return res.json({ token, hostel_id: hostelId });
+    return res.json({ token, hostel_id: hostelId, accessible_hostel_ids: scope.accessibleHostelIds, mess_no: scope.messNo });
   } catch (err) {
     console.error('[MANAGER LOGIN] Error:', err);
     flowLog('MANAGER LOGIN', 'Error', { email, error: err?.message || String(err) });
@@ -191,8 +233,14 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
     if (req.user?.role !== 'manager') return res.status(403).json({ error: 'Forbidden' });
 
     const today = getISTDateString();
-    const managerHostelId = await getActiveManagerHostel({ userId: managerId, date: today });
+    const managerScope = await getManagerScope({ userId: managerId, date: today });
+    const managerHostelId = managerScope.primaryHostelId;
     if (!managerHostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
+    const targetRequestedHostelId = parseRequestedHostelId(req.body?.hostel_id, managerHostelId);
+    if (!targetRequestedHostelId) return res.status(400).json({ error: 'hostel_id must be a valid number' });
+    if (!managerScope.accessibleHostelIds.includes(Number(targetRequestedHostelId))) {
+      return res.status(403).json({ error: 'Manager not assigned to this hostel/mess scope' });
+    }
 
     const qrToken = req.body?.qr_token ?? req.body?.qrToken ?? null;
     const passcode = normalizePasscode(req.body?.passcode);
@@ -208,7 +256,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
 
     const mode = qrToken && typeof qrToken === 'string' ? 'qr' : 'code';
     flowLog('ATTENDANCE', 'Mark request received', { manager_email: req.user?.email, meal_type: meal, mode, qr_token: qrToken ? '[present]' : undefined, passcode: passcode ? '[present]' : undefined });
-    req.log?.info('admin.mark_attendance.start', { manager_id: managerId, hostel_id: managerHostelId, date: today, meal, mode });
+    req.log?.info('admin.mark_attendance.start', { manager_id: managerId, hostel_id: targetRequestedHostelId, date: today, meal, mode });
 
     // Determine student identity from scanned QR token or short passcode.
     let studentIdFromToken = null;
@@ -237,7 +285,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
           AND a.hostel_id = $1
           AND a.start_date <= $2
           AND (a.end_date IS NULL OR a.end_date >= $2)`,
-        [managerHostelId, today]
+        [targetRequestedHostelId, today]
       );
       const steps = getCandidateSteps({ ttlSeconds, leewaySeconds });
       const matchedIds = [];
@@ -252,7 +300,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
       if (matchedIds.length === 0) return res.status(400).json({ error: 'Invalid or expired passcode' });
       if (matchedIds.length > 1) return res.status(409).json({ error: 'Passcode collision. Please scan QR.' });
       studentIdFromToken = Number(matchedIds[0]);
-      hostelFromToken = managerHostelId;
+      hostelFromToken = targetRequestedHostelId;
     }
 
     if (studentIdFromToken === null || studentIdFromToken === undefined) {
@@ -261,9 +309,10 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
 
     flowLog('ATTENDANCE', mode === 'qr' ? 'QR token verified' : 'Passcode verified', { student_id: studentIdFromToken, hostel_id: hostelFromToken ?? '' });
 
-    // Safety check: token hostel should match manager hostel (prevents cross-hostel scans).
-    if (hostelFromToken && String(hostelFromToken) !== String(managerHostelId)) {
-      return res.status(403).json({ error: 'Student not enrolled in this hostel' });
+    const scanHostelId = hostelFromToken ? Number(hostelFromToken) : Number(targetRequestedHostelId);
+    if (!Number.isFinite(scanHostelId)) return res.status(400).json({ error: 'Invalid hostel in token/request' });
+    if (!managerScope.accessibleHostelIds.includes(scanHostelId)) {
+      return res.status(403).json({ error: 'Student not enrolled in manager hostel/mess scope' });
     }
 
     const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [Number(studentIdFromToken)]);
@@ -279,19 +328,19 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
          AND start_date <= $3
          AND (end_date IS NULL OR end_date >= $3)
        LIMIT 1`,
-      [student.id, managerHostelId, today]
+      [student.id, scanHostelId, today]
     );
     if (assignmentRes.rows.length === 0) return res.status(403).json({ error: 'Student not enrolled in this hostel' });
 
     // Enforce meal availability: override > weekly template > default open.
-    const effectiveStatus = await getEffectiveMealStatus({ hostelId: managerHostelId, date: today, meal });
+    const effectiveStatus = await getEffectiveMealStatus({ hostelId: scanHostelId, date: today, meal });
     if (String(effectiveStatus).toLowerCase() === 'holiday') {
       return res.status(409).json({ message: 'Meal is marked as holiday' });
     }
 
     // Enforce meal window (IST) with grace_minutes.
     const nowMin = getNowISTMinutes();
-    const window = await getHostelMealWindow({ hostelId: managerHostelId, meal });
+    const window = await getHostelMealWindow({ hostelId: scanHostelId, meal });
     if (nowMin !== null && window) {
       const startMin = parseTimeToMinutes(window.start_time);
       const endMin = parseTimeToMinutes(window.end_time);
@@ -309,7 +358,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (hostel_id, date, meal, user_id) DO NOTHING
        RETURNING scanned_at`,
-      [student.id, managerHostelId, today, meal, managerId, req.body?.source ?? mode]
+      [student.id, scanHostelId, today, meal, managerId, req.body?.source ?? mode]
     );
     if ((insertRes.rowCount || 0) === 0) {
       const existingRes = await pool.query(
@@ -318,7 +367,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
          WHERE user_id = $1 AND hostel_id = $2 AND date = $3 AND meal = $4
          ORDER BY scanned_at DESC
          LIMIT 1`,
-        [student.id, managerHostelId, today, meal]
+        [student.id, scanHostelId, today, meal]
       );
       const markedAt = existingRes.rows?.[0]?.scanned_at ? new Date(existingRes.rows[0].scanned_at).toISOString() : null;
       req.log?.warn('admin.mark_attendance.duplicate', {
@@ -327,7 +376,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
         student_email: student.email ?? null,
         student_name: student.name ?? null,
         student_roll_no: student.roll_no ?? null,
-        hostel_id: managerHostelId,
+        hostel_id: scanHostelId,
         date: today,
         meal,
         marked_at: markedAt,
@@ -339,7 +388,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
         actorUserId: managerId,
         action: 'ATTENDANCE_ALREADY_MARKED',
         entityType: 'attendance_scan',
-        entityId: `${managerHostelId}:${today}:${meal}:${student.id}`,
+        entityId: `${scanHostelId}:${today}:${meal}:${student.id}`,
         details: {
           ...getReqMeta(req),
           student_id: student.id,
@@ -361,7 +410,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
       });
     }
 
-    req.log?.info('admin.mark_attendance.success', { manager_id: managerId, student_id: student.id, hostel_id: managerHostelId, date: today, meal });
+    req.log?.info('admin.mark_attendance.success', { manager_id: managerId, student_id: student.id, hostel_id: scanHostelId, date: today, meal });
     flowLog('ATTENDANCE', 'Marked', { student_email: student.email, meal_type: meal, date: today });
     req.setLogSummary?.(`attendance marked for ${student.email} (${meal})`, { student_id: student.id, meal });
     await writeAuditLog({
@@ -369,7 +418,7 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
       actorUserId: managerId,
       action: 'ATTENDANCE_MARKED',
       entityType: 'attendance_scan',
-      entityId: `${managerHostelId}:${today}:${meal}:${student.id}`,
+      entityId: `${scanHostelId}:${today}:${meal}:${student.id}`,
       details: { ...getReqMeta(req), student_id: student.id, student_email: student.email, source: req.body?.source ?? mode },
     });
     return res.json({ message: 'Attendance marked' });
@@ -396,8 +445,12 @@ router.get('/qr-scans/today', authenticateToken, async (req, res) => {
     if (!managerId) return res.status(401).json({ error: 'Unauthorized' });
 
     const today = getISTDateString();
-    const hostelId = await getActiveManagerHostel({ userId: managerId, date: today });
+    const scope = await getManagerScope({ userId: managerId, date: today });
+    const hostelId = parseRequestedHostelId(req.query.hostel_id, scope.primaryHostelId);
     if (!hostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
+    if (!scope.accessibleHostelIds.includes(Number(hostelId))) {
+      return res.status(403).json({ error: 'Manager not assigned to this hostel/mess scope' });
+    }
 
     flowLog('QR SCANS', 'Today summary requested', { hostel_id: hostelId, date: today });
     const totalRes = await pool.query(
@@ -447,8 +500,12 @@ router.get('/qr-scans/summary', authenticateToken, async (req, res) => {
     if (!managerId) return res.status(401).json({ error: 'Unauthorized' });
 
     const today = getISTDateString();
-    const hostelId = await getActiveManagerHostel({ userId: managerId, date: today });
+    const scope = await getManagerScope({ userId: managerId, date: today });
+    const hostelId = parseRequestedHostelId(req.query.hostel_id, scope.primaryHostelId);
     if (!hostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
+    if (!scope.accessibleHostelIds.includes(Number(hostelId))) {
+      return res.status(403).json({ error: 'Manager not assigned to this hostel/mess scope' });
+    }
 
     flowLog('QR SCANS', 'Range summary requested', { hostel_id: hostelId, from, to });
     const grouped = await pool.query(
@@ -509,8 +566,12 @@ router.get('/qr-scans/details', authenticateToken, async (req, res) => {
     if (!meal) return res.status(400).json({ error: 'meal_type is required' });
 
     const today = getISTDateString();
-    const hostelId = await getActiveManagerHostel({ userId: managerId, date: today });
+    const scope = await getManagerScope({ userId: managerId, date: today });
+    const hostelId = parseRequestedHostelId(req.query.hostel_id, scope.primaryHostelId);
     if (!hostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
+    if (!scope.accessibleHostelIds.includes(Number(hostelId))) {
+      return res.status(403).json({ error: 'Manager not assigned to this hostel/mess scope' });
+    }
 
     flowLog('QR SCANS DETAILS', 'Request received', {
       manager_email: req.user?.email,
