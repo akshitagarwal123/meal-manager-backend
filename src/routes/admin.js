@@ -580,13 +580,12 @@ router.get('/qr-scans/details', authenticateToken, async (req, res) => {
       meal_type: meal,
     });
     const result = await pool.query(
-      `SELECT u.email, u.name, u.roll_no, a.scanned_at AS marked_at,
-              h.name AS hostel_name, h.hostel_code
+      `SELECT u.name, u.roll_no, u.room_no, h.name AS hostel_name, a.scanned_at AS marked_at
        FROM attendance_scans a
        JOIN users u ON u.id = a.user_id
        JOIN hostels h ON h.id = a.hostel_id
        WHERE a.hostel_id = $1 AND a.date = $2 AND a.meal = $3
-       ORDER BY COALESCE(u.name, u.email) ASC`,
+       ORDER BY a.scanned_at ASC`,
       [hostelId, date, meal]
     );
 
