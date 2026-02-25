@@ -278,29 +278,29 @@ router.post('/mark-attendance', authenticateToken, async (req, res) => {
       }
     } else {
       const activeStudentsRes = await pool.query(
-        `SELECT u.id
+        `SELECT u.id, a.hostel_id
          FROM users u
          INNER JOIN user_hostel_assignments a
            ON a.user_id = u.id
-          AND a.hostel_id = $1
+          AND a.hostel_id = ANY($1::int[])
           AND a.start_date <= $2
           AND (a.end_date IS NULL OR a.end_date >= $2)`,
-        [targetRequestedHostelId, today]
+        [managerScope.accessibleHostelIds, today]
       );
       const steps = getCandidateSteps({ ttlSeconds, leewaySeconds });
-      const matchedIds = [];
+      const matches = [];
       for (const row of activeStudentsRes.rows) {
         for (const step of steps) {
           if (generateShortCode({ userId: row.id, secret: tokenSecret, step }) === passcode) {
-            matchedIds.push(row.id);
+            matches.push({ userId: row.id, hostelId: row.hostel_id });
             break;
           }
         }
       }
-      if (matchedIds.length === 0) return res.status(400).json({ error: 'Invalid or expired passcode' });
-      if (matchedIds.length > 1) return res.status(409).json({ error: 'Passcode collision. Please scan QR.' });
-      studentIdFromToken = Number(matchedIds[0]);
-      hostelFromToken = targetRequestedHostelId;
+      if (matches.length === 0) return res.status(400).json({ error: 'Invalid or expired passcode' });
+      if (matches.length > 1) return res.status(409).json({ error: 'Passcode collision. Please scan QR.' });
+      studentIdFromToken = Number(matches[0].userId);
+      hostelFromToken = Number(matches[0].hostelId);
     }
 
     if (studentIdFromToken === null || studentIdFromToken === undefined) {
