@@ -62,21 +62,59 @@ router.get('/me', authenticateToken, async (req, res) => {
     const u = userRes.rows[0];
     if (u.is_active === false) return res.status(403).json({ error: 'User is inactive' });
 
-    const hostelId =
-      u.role === 'manager'
-        ? await getActiveManagerHostel({ userId, date: today })
-        : await getActiveHostelAssignment({ userId, date: today });
-
+    let hostelId = null;
     let hostel = null;
-    if (hostelId) {
-      const hostelRes = await pool.query(
-        `SELECT id, hostel_code, name, address, college_id
-         FROM hostels
-         WHERE id = $1
-         LIMIT 1`,
-        [hostelId]
+    let hostels = [];
+    let messNo = null;
+
+    if (u.role === 'manager') {
+      const staffRes = await pool.query(
+        `SELECT hs.hostel_id, h.mess_no
+         FROM hostel_staff hs
+         JOIN hostels h ON h.id = hs.hostel_id
+         WHERE hs.user_id = $1
+           AND hs.start_date <= $2
+           AND (hs.end_date IS NULL OR hs.end_date >= $2)
+         ORDER BY hs.start_date DESC`,
+        [userId, today]
       );
-      hostel = hostelRes.rows?.[0] ?? null;
+      const primaryHostelId = staffRes.rows?.[0]?.hostel_id ?? null;
+      messNo = staffRes.rows?.[0]?.mess_no ?? null;
+
+      let hostelIds = staffRes.rows.map(r => r.hostel_id);
+      if (messNo) {
+        const messRes = await pool.query(
+          `SELECT id FROM hostels WHERE mess_no = $1 AND is_active = true`,
+          [messNo]
+        );
+        hostelIds = Array.from(new Set([...hostelIds, ...messRes.rows.map(r => r.id)]));
+      }
+
+      if (hostelIds.length > 0) {
+        const hostelRes = await pool.query(
+          `SELECT id, hostel_code, name, address, college_id
+           FROM hostels
+           WHERE id = ANY($1::int[])
+           ORDER BY name ASC`,
+          [hostelIds]
+        );
+        hostels = hostelRes.rows;
+      }
+
+      hostelId = primaryHostelId;
+      hostel = hostels.find(h => h.id === primaryHostelId) ?? null;
+    } else {
+      hostelId = await getActiveHostelAssignment({ userId, date: today });
+      if (hostelId) {
+        const hostelRes = await pool.query(
+          `SELECT id, hostel_code, name, address, college_id
+           FROM hostels
+           WHERE id = $1
+           LIMIT 1`,
+          [hostelId]
+        );
+        hostel = hostelRes.rows?.[0] ?? null;
+      }
     }
 
     await writeAuditLog({
@@ -104,8 +142,9 @@ router.get('/me', authenticateToken, async (req, res) => {
       college: u.college_id
         ? { id: u.college_id, code: u.college_code ?? null, name: u.college_name ?? null }
         : null,
-      hostel_id: hostelId ?? null,
-      hostel,
+      ...(u.role === 'manager'
+        ? { mess_no: messNo, hostels }
+        : { hostel_id: hostelId ?? null, hostel }),
     });
   } catch (err) {
     console.error('[USER ME] Error:', err.message);
