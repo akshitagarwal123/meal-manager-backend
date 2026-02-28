@@ -181,10 +181,11 @@ async function main() {
          SELECT mt.meal,
                 COALESCE(mc.status, twm.status, 'open') AS status
          FROM meal_types mt
+         LEFT JOIN LATERAL (SELECT mess_id FROM hostels WHERE id = $1) h ON true
          LEFT JOIN meal_calendars mc
-           ON mc.hostel_id = $1 AND mc.date = $2::date AND mc.meal = mt.meal
-         LEFT JOIN hostel_weekly_menus twm
-           ON twm.hostel_id = $1
+           ON mc.mess_id = h.mess_id AND mc.date = $2::date AND mc.meal = mt.meal
+         LEFT JOIN mess_weekly_menus twm
+           ON twm.mess_id = h.mess_id
           AND twm.day_of_week = EXTRACT(DOW FROM $2::date)::int
           AND twm.meal = mt.meal`,
         [hostelId, dateYmd]

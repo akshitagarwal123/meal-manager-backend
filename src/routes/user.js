@@ -7,6 +7,7 @@ const { writeAuditLog, getReqMeta } = require('../utils/audit');
 const { flowLog, mask } = require('../utils/flowLog');
 const { respondServerError } = require('../utils/http');
 const { getTimeStep, generateShortCode } = require('../utils/shortCode');
+const { getStudentMessId } = require('../utils/messScope');
 
 const router = express.Router();
 
@@ -65,11 +66,12 @@ router.get('/me', authenticateToken, async (req, res) => {
     let hostelId = null;
     let hostel = null;
     let hostels = [];
+    let messId = null;
     let messNo = null;
 
     if (u.role === 'manager') {
       const staffRes = await pool.query(
-        `SELECT hs.hostel_id, h.mess_no
+        `SELECT hs.hostel_id, h.mess_id, h.mess_no
          FROM hostel_staff hs
          JOIN hostels h ON h.id = hs.hostel_id
          WHERE hs.user_id = $1
@@ -79,15 +81,18 @@ router.get('/me', authenticateToken, async (req, res) => {
         [userId, today]
       );
       const primaryHostelId = staffRes.rows?.[0]?.hostel_id ?? null;
+      messId = staffRes.rows?.[0]?.mess_id ?? null;
       messNo = staffRes.rows?.[0]?.mess_no ?? null;
 
-      let hostelIds = staffRes.rows.map(r => r.hostel_id);
-      if (messNo) {
+      let hostelIds = [];
+      if (messId) {
         const messRes = await pool.query(
-          `SELECT id FROM hostels WHERE mess_no = $1 AND is_active = true`,
-          [messNo]
+          `SELECT id FROM hostels WHERE mess_id = $1 AND is_active = true`,
+          [messId]
         );
-        hostelIds = Array.from(new Set([...hostelIds, ...messRes.rows.map(r => r.id)]));
+        hostelIds = messRes.rows.map(r => r.id);
+      } else {
+        hostelIds = staffRes.rows.map(r => r.hostel_id);
       }
 
       if (hostelIds.length > 0) {
@@ -143,7 +148,7 @@ router.get('/me', authenticateToken, async (req, res) => {
         ? { id: u.college_id, code: u.college_code ?? null, name: u.college_name ?? null }
         : null,
       ...(u.role === 'manager'
-        ? { mess_no: messNo, hostels }
+        ? { mess_id: messId, mess_no: messNo, hostels }
         : { hostel_id: hostelId ?? null, hostel }),
     });
   } catch (err) {
@@ -460,6 +465,9 @@ router.get('/assigned-meals', authenticateToken, async (req, res) => {
     const hostelId = await getActiveHostelAssignment({ userId, date: today });
     if (!hostelId) return res.status(403).json({ error: 'User not enrolled in any hostel' });
 
+    const messId = await getStudentMessId({ userId, date: today });
+    if (!messId) return res.status(403).json({ error: 'User hostel not linked to any mess' });
+
     const daysRes = await pool.query(
       `SELECT to_char(d::date, 'YYYY-MM-DD') AS date, EXTRACT(DOW FROM d)::int AS dow
        FROM generate_series($1::date, ($1::date + INTERVAL '6 day')::date, INTERVAL '1 day') d`,
@@ -468,19 +476,19 @@ router.get('/assigned-meals', authenticateToken, async (req, res) => {
 
     const templateRes = await pool.query(
       `SELECT day_of_week, meal, status, note, items
-       FROM hostel_weekly_menus
-       WHERE hostel_id = $1`,
-      [hostelId]
+       FROM mess_weekly_menus
+       WHERE mess_id = $1`,
+      [messId]
     );
     const templates = new Map(templateRes.rows.map(r => [`${r.day_of_week}:${r.meal}`, r]));
 
     const overrideRes = await pool.query(
       `SELECT to_char(date::date, 'YYYY-MM-DD') AS date, meal, status, note, items
        FROM meal_calendars
-       WHERE hostel_id = $1
+       WHERE mess_id = $1
          AND date >= $2::date
          AND date <= ($2::date + INTERVAL '6 day')::date`,
-      [hostelId, today]
+      [messId, today]
     );
     const overrides = new Map(overrideRes.rows.map(r => [`${r.date}:${r.meal}`, r]));
 
@@ -608,11 +616,12 @@ router.get('/stats', authenticateToken, async (req, res) => {
                 mt.meal,
                 COALESCE(mc.status, twm.status, 'open') AS status
          FROM assigned_days ad
+         JOIN hostels h ON h.id = ad.hostel_id
          CROSS JOIN meal_types mt
          LEFT JOIN meal_calendars mc
-           ON mc.hostel_id = ad.hostel_id AND mc.date = ad.date AND mc.meal = mt.meal
-         LEFT JOIN hostel_weekly_menus twm
-           ON twm.hostel_id = ad.hostel_id AND twm.day_of_week = ad.dow AND twm.meal = mt.meal
+           ON mc.mess_id = h.mess_id AND mc.date = ad.date AND mc.meal = mt.meal
+         LEFT JOIN mess_weekly_menus twm
+           ON twm.mess_id = h.mess_id AND twm.day_of_week = ad.dow AND twm.meal = mt.meal
        ),
        eligible AS (
          SELECT meal, SUM((status = 'open')::int)::int AS eligible
