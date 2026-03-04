@@ -546,7 +546,7 @@ router.get('/qr-scans/details', authenticateToken, async (req, res) => {
 router.get('/audit-logs', authenticateToken, async (req, res) => {
   const requester = req.user;
   if (!requester?.id) return res.status(401).json({ error: 'Unauthorized' });
-  if (requester.role !== 'manager') return res.status(403).json({ error: 'Forbidden' });
+  if (!['manager', 'admin'].includes(requester.role)) return res.status(403).json({ error: 'Forbidden' });
 
   const limitRaw = Number(req.query.limit ?? 100);
   const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.floor(limitRaw))) : 100;

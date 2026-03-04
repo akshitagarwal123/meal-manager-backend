@@ -50,6 +50,7 @@ app.use('/user', require('./routes/user'));
 app.use('/auth', require('./routes/auth'));
 app.use('/admin', require('./routes/admin'));
 app.use('/meals', require('./routes/meals'));
+app.use('/manage', require('./routes/manage'));
 
 app.get('/', (req, res) => {
   res.json({ ok: true, message: 'Backend is running' });
