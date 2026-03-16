@@ -374,24 +374,29 @@ router.get('/qr-scans/today', authenticateToken, async (req, res) => {
 
     const today = getISTDateString();
     const scope = await getManagerScope({ userId: managerId, date: today });
-    const hostelId = parseRequestedHostelId(req.query.hostel_id, scope.primaryHostelId);
-    if (!hostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
-    if (!scope.accessibleHostelIds.includes(Number(hostelId))) {
+    if (!scope.primaryHostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
+
+    const isAllHostels = !req.query.hostel_id;
+    const hostelIds = isAllHostels
+      ? scope.accessibleHostelIds
+      : [Number(req.query.hostel_id)];
+
+    if (!isAllHostels && !scope.accessibleHostelIds.includes(hostelIds[0])) {
       return res.status(403).json({ error: 'Manager not assigned to this hostel/mess scope' });
     }
 
-    flowLog('QR SCANS', 'Today summary requested', { hostel_id: hostelId, date: today });
+    flowLog('QR SCANS', 'Today summary requested', { hostel_ids: hostelIds, date: today });
     const totalRes = await pool.query(
-      `SELECT COUNT(*)::int AS total FROM attendance_scans WHERE hostel_id = $1 AND date = $2`,
-      [hostelId, today]
+      `SELECT COUNT(*)::int AS total FROM attendance_scans WHERE hostel_id = ANY($1::bigint[]) AND date = $2`,
+      [hostelIds, today]
     );
     const breakdownRes = await pool.query(
       `SELECT meal, COUNT(*)::int AS count
        FROM attendance_scans
-       WHERE hostel_id = $1 AND date = $2
+       WHERE hostel_id = ANY($1::bigint[]) AND date = $2
        GROUP BY meal
        ORDER BY meal ASC`,
-      [hostelId, today]
+      [hostelIds, today]
     );
 
     await writeAuditLog({
@@ -399,11 +404,11 @@ router.get('/qr-scans/today', authenticateToken, async (req, res) => {
       actorUserId: managerId,
       action: 'QR_SCANS_TODAY',
       entityType: 'hostel',
-      entityId: hostelId,
+      entityId: isAllHostels ? 'all' : String(hostelIds[0]),
       details: { ...getReqMeta(req), date: today, total: totalRes.rows[0]?.total ?? 0 },
     });
-    flowLog('QR SCANS', 'Today summary returned', { hostel_id: hostelId, total: totalRes.rows[0]?.total ?? 0 });
-    return res.json({ date: today, hostel_id: hostelId, total: totalRes.rows[0]?.total ?? 0, breakdown: breakdownRes.rows });
+    flowLog('QR SCANS', 'Today summary returned', { hostel_ids: hostelIds, total: totalRes.rows[0]?.total ?? 0 });
+    return res.json({ date: today, hostel_id: isAllHostels ? null : hostelIds[0], total: totalRes.rows[0]?.total ?? 0, breakdown: breakdownRes.rows });
   } catch (err) {
     flowLog('QR SCANS', 'Today summary error', { error: err?.message || String(err) });
     await writeAuditLog({
@@ -429,26 +434,31 @@ router.get('/qr-scans/summary', authenticateToken, async (req, res) => {
 
     const today = getISTDateString();
     const scope = await getManagerScope({ userId: managerId, date: today });
-    const hostelId = parseRequestedHostelId(req.query.hostel_id, scope.primaryHostelId);
-    if (!hostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
-    if (!scope.accessibleHostelIds.includes(Number(hostelId))) {
+    if (!scope.primaryHostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
+
+    const isAllHostels = !req.query.hostel_id;
+    const hostelIds = isAllHostels
+      ? scope.accessibleHostelIds
+      : [Number(req.query.hostel_id)];
+
+    if (!isAllHostels && !scope.accessibleHostelIds.includes(hostelIds[0])) {
       return res.status(403).json({ error: 'Manager not assigned to this hostel/mess scope' });
     }
 
-    flowLog('QR SCANS', 'Range summary requested', { hostel_id: hostelId, from, to });
+    flowLog('QR SCANS', 'Range summary requested', { hostel_ids: hostelIds, from, to });
     const grouped = await pool.query(
       `SELECT date::text AS date, meal, COUNT(*)::int AS count
        FROM attendance_scans
-       WHERE hostel_id = $1 AND date >= $2 AND date <= $3
+       WHERE hostel_id = ANY($1::bigint[]) AND date >= $2 AND date <= $3
        GROUP BY date, meal
        ORDER BY date ASC`,
-      [hostelId, from, to]
+      [hostelIds, from, to]
     );
     const totalRes = await pool.query(
       `SELECT COUNT(*)::int AS total
        FROM attendance_scans
-       WHERE hostel_id = $1 AND date >= $2 AND date <= $3`,
-      [hostelId, from, to]
+       WHERE hostel_id = ANY($1::bigint[]) AND date >= $2 AND date <= $3`,
+      [hostelIds, from, to]
     );
 
     const byDateMap = {};
@@ -464,11 +474,11 @@ router.get('/qr-scans/summary', authenticateToken, async (req, res) => {
       actorUserId: managerId,
       action: 'QR_SCANS_SUMMARY',
       entityType: 'hostel',
-      entityId: hostelId,
+      entityId: isAllHostels ? 'all' : String(hostelIds[0]),
       details: { ...getReqMeta(req), from, to, total: totalRes.rows[0]?.total ?? 0 },
     });
-    flowLog('QR SCANS', 'Range summary returned', { hostel_id: hostelId, total: totalRes.rows[0]?.total ?? 0 });
-    return res.json({ from, to, hostel_id: hostelId, total: totalRes.rows[0]?.total ?? 0, byDate: Object.values(byDateMap) });
+    flowLog('QR SCANS', 'Range summary returned', { hostel_ids: hostelIds, total: totalRes.rows[0]?.total ?? 0 });
+    return res.json({ from, to, hostel_id: isAllHostels ? null : hostelIds[0], total: totalRes.rows[0]?.total ?? 0, byDate: Object.values(byDateMap) });
   } catch (err) {
     flowLog('QR SCANS', 'Range summary error', { error: err?.message || String(err) });
     await writeAuditLog({
@@ -495,15 +505,20 @@ router.get('/qr-scans/details', authenticateToken, async (req, res) => {
 
     const today = getISTDateString();
     const scope = await getManagerScope({ userId: managerId, date: today });
-    const hostelId = parseRequestedHostelId(req.query.hostel_id, scope.primaryHostelId);
-    if (!hostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
-    if (!scope.accessibleHostelIds.includes(Number(hostelId))) {
+    if (!scope.primaryHostelId) return res.status(400).json({ error: 'Manager hostel ID not found' });
+
+    const isAllHostels = !req.query.hostel_id;
+    const hostelIds = isAllHostels
+      ? scope.accessibleHostelIds
+      : [Number(req.query.hostel_id)];
+
+    if (!isAllHostels && !scope.accessibleHostelIds.includes(hostelIds[0])) {
       return res.status(403).json({ error: 'Manager not assigned to this hostel/mess scope' });
     }
 
     flowLog('QR SCANS DETAILS', 'Request received', {
       manager_email: req.user?.email,
-      hostel_id: hostelId,
+      hostel_ids: hostelIds,
       date,
       meal_type: meal,
     });
@@ -512,9 +527,9 @@ router.get('/qr-scans/details', authenticateToken, async (req, res) => {
        FROM attendance_scans a
        JOIN users u ON u.id = a.user_id
        JOIN hostels h ON h.id = a.hostel_id
-       WHERE a.hostel_id = $1 AND a.date = $2 AND a.meal = $3
+       WHERE a.hostel_id = ANY($1::bigint[]) AND a.date = $2 AND a.meal = $3
        ORDER BY a.scanned_at ASC`,
-      [hostelId, date, meal]
+      [hostelIds, date, meal]
     );
 
     await writeAuditLog({
@@ -522,11 +537,11 @@ router.get('/qr-scans/details', authenticateToken, async (req, res) => {
       actorUserId: managerId,
       action: 'QR_SCANS_DETAILS',
       entityType: 'attendance_scan',
-      entityId: `${hostelId}:${date}:${meal}`,
+      entityId: `${isAllHostels ? 'all' : hostelIds[0]}:${date}:${meal}`,
       details: { ...getReqMeta(req), count: result.rows.length },
     });
-    flowLog('QR SCANS DETAILS', 'Response sent', { hostel_id: hostelId, date, meal_type: meal, count: result.rows.length });
-    return res.json({ date, meal, hostel_id: hostelId, attendees: result.rows });
+    flowLog('QR SCANS DETAILS', 'Response sent', { hostel_ids: hostelIds, date, meal_type: meal, count: result.rows.length });
+    return res.json({ date, meal, hostel_id: isAllHostels ? null : hostelIds[0], attendees: result.rows });
   } catch (err) {
     flowLog('QR SCANS DETAILS', 'Error', { error: err?.message || String(err) });
     await writeAuditLog({
