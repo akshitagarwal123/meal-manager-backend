@@ -275,21 +275,19 @@ router.delete('/users/:id', requireRole('admin'), async (req, res) => {
   }
 });
 
-// DELETE /manage/users/:id/permanent — Hard delete
+// DELETE /manage/users/:id/permanent — Hard delete (preserves attendance & assignment data)
 router.delete('/users/:id/permanent', requireRole('admin'), async (req, res) => {
   const userId = Number(req.params.id);
 
   try {
-    // Remove related records first
-    await pool.query(`DELETE FROM attendance_scans WHERE user_id = $1`, [userId]);
-    await pool.query(`DELETE FROM user_hostel_assignments WHERE user_id = $1`, [userId]);
-    await pool.query(`DELETE FROM hostel_staff WHERE user_id = $1`, [userId]);
+    // Store user info before deletion for audit
+    const userRes = await pool.query(`SELECT id, email, name FROM users WHERE id = $1`, [userId]);
+    if (userRes.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+    const { email, name } = userRes.rows[0];
 
-    const result = await pool.query(
-      `DELETE FROM users WHERE id = $1 RETURNING id, email`,
-      [userId]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+    // Delete user — related records are preserved with user_id set to NULL
+    // via ON DELETE SET NULL foreign key constraints
+    await pool.query(`DELETE FROM users WHERE id = $1`, [userId]);
 
     await writeAuditLog({
       collegeId: req.user?.college_id ?? null,
@@ -297,9 +295,9 @@ router.delete('/users/:id/permanent', requireRole('admin'), async (req, res) => 
       action: 'MANAGE_USER_PERMANENT_DELETE',
       entityType: 'user',
       entityId: userId,
-      details: { ...getReqMeta(req), deleted_email: result.rows[0].email },
+      details: { ...getReqMeta(req), deleted_email: email, deleted_name: name },
     });
-    flowLog('MANAGE USERS', 'Permanently deleted', { id: userId });
+    flowLog('MANAGE USERS', 'Permanently deleted', { id: userId, email });
     return res.json({ success: true, message: 'User permanently deleted' });
   } catch (err) {
     flowLog('MANAGE USERS', 'Permanent delete error', { error: err?.message || String(err) });
