@@ -275,6 +275,38 @@ router.delete('/users/:id', requireRole('admin'), async (req, res) => {
   }
 });
 
+// DELETE /manage/users/:id/permanent — Hard delete
+router.delete('/users/:id/permanent', requireRole('admin'), async (req, res) => {
+  const userId = Number(req.params.id);
+
+  try {
+    // Remove related records first
+    await pool.query(`DELETE FROM attendance_scans WHERE user_id = $1`, [userId]);
+    await pool.query(`DELETE FROM user_hostel_assignments WHERE user_id = $1`, [userId]);
+    await pool.query(`DELETE FROM hostel_staff WHERE user_id = $1`, [userId]);
+
+    const result = await pool.query(
+      `DELETE FROM users WHERE id = $1 RETURNING id, email`,
+      [userId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+
+    await writeAuditLog({
+      collegeId: req.user?.college_id ?? null,
+      actorUserId: req.user.id,
+      action: 'MANAGE_USER_PERMANENT_DELETE',
+      entityType: 'user',
+      entityId: userId,
+      details: { ...getReqMeta(req), deleted_email: result.rows[0].email },
+    });
+    flowLog('MANAGE USERS', 'Permanently deleted', { id: userId });
+    return res.json({ success: true, message: 'User permanently deleted' });
+  } catch (err) {
+    flowLog('MANAGE USERS', 'Permanent delete error', { error: err?.message || String(err) });
+    return respondServerError(res, req, 'Server error', err);
+  }
+});
+
 // ─── Hostels (admin only) ────────────────────────────────────────────────────
 
 // POST /manage/hostels — Create hostel
